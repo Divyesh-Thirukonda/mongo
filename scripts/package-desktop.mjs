@@ -40,6 +40,7 @@ await writeFile(join(shell, "launcher-config.json"), JSON.stringify({
   envFile: resolve(process.env.CONVERGE_ENV_FILE ?? join(workspace, ".env.local")),
   dataDir: resolve(process.env.CONVERGE_DATA_DIR ?? join(workspace, ".converge")),
   port: 3000,
+  appUrl: process.env.CONVERGE_APP_URL,
 }, null, 2));
 
 async function assertNoEnvironmentFiles(directory) {
