@@ -50,11 +50,15 @@ To use the public UI with a local worker, point both services at the same Atlas 
 1. Create a workspace and submit “Connect Stripe and display the product catalog”.
 2. Share an invitation. Join with a second guest identity in another browser or the native guest window.
 3. Submit “Add NEW to the 3 most recently added Stripe products”. The worker sends `turn/steer` if the first turn is active; otherwise it continues the same coding thread.
-4. Inspect **Changes** for source diffs, protected checks, and the catalog preview.
+4. Open **Preview** for the actual generated website. **Changes** contains source diffs and protected checks.
 5. Submit “Remove all NEW badges” to exercise conflict arbitration. Choose which direction to keep; both original requests remain in the ledger.
 6. Inspect **Memory**, pause, and resume. Atlas checkpoints preserve requirements and the controlled source manifest across worker restarts.
+7. Select a node in **Activity**, open **Change this step**, and describe a correction. The new direction retains its author and a link to the original step; the old history remains visible.
+8. Select a saved checkpoint and choose **Restore this checkpoint** to return to its files and request decisions. The worker stops its coding process first, saves an undo checkpoint, restores, and pauses. Resume or submit a new direction when ready. Older checkpoints without saved request decisions support corrections but cannot restore the full state.
 
 The catalog uses a **Stripe-compatible fixture**, including pagination and inactive products. No live Stripe account, checkout, or payment processing is connected. Starter prompts fill the composer without submitting work.
+
+**Preview** bundles the workspace's `index.html` (or `public/index.html`) with local JavaScript, TypeScript, CSS, and SVG assets. It is interactive, refreshes as the worker saves files, and is shared through Atlas. It runs in an isolated iframe without access to session cookies or external connections. It does not start arbitrary application servers or install dependencies; unsupported imports show an actionable error. Source stays in `.converge/workspaces/<session-id>` on the worker (or `CONVERGE_DATA_DIR/workspaces/<session-id>`).
 
 **Connect Codex** issues a workspace-scoped MCP credential that expires after seven days. It exposes shared context, changes, and progress reporting to an external Codex client; it cannot impersonate a human intent submission. The Mac app can add the connection to Codex directly; browser users copy the setup command. The companion skill is in `integrations/codex-plugin/converge`. Treat the connection command and invitation URL as private access links.
 
@@ -64,6 +68,8 @@ The catalog uses a **Stripe-compatible fixture**, including pagination and inact
 - OpenRouter supplies real routing/coding inference. Routing can explicitly fall back to conservative rules; coding errors remain visible.
 - Better Auth provides cookie-based anonymous and email/password identities. Every workspace API checks membership. Email verification and password recovery are not configured for this demo.
 - Atlas preserves intents, final trajectory items, checkpoints, and source manifests. Legacy sessions without memberships stay unlisted.
+- History actions use membership checks, idempotency keys, and revision checks. A pending restore blocks concurrent mutations, retains its original recovery point across restarts, and clears the prior Codex thread so stale working context cannot overwrite the restored direction.
+- Source checkpoints include supported root web files and text files in `src`, `tests`, `public`, and `assets`, with a 40-file / 1 MB limit. Unsupported files inside those directories fail capture rather than silently disappearing. Secrets, symlinks, and invalid paths are rejected.
 - Trusted assertions run outside generated code. Unsupported acceptance criteria require review; generated tests cannot declare the work complete.
 - Working context is capped at 16,000 characters and 64 active requirements. Mandatory requirements that cannot fit stop execution instead of being dropped.
 - Each fixed hour admits at most **30 routing/turn operations per workspace, 60 per owner, and 100 across the database**, reserved atomically. These are admission limits, not token, dollar, or provider-subrequest caps. API/auth limits also apply; exhausted work remains saved for a later resume.
@@ -85,6 +91,7 @@ npm run desktop:package
 ```sh
 CONVERGE_AUTH_INTEGRATION=1 node --conditions=react-server --env-file=.env.local --import tsx --test tests/auth-isolation.test.ts
 CONVERGE_BUDGET_INTEGRATION=1 node --conditions=react-server --env-file=.env.local --import tsx --test tests/model-budget.test.ts
+CONVERGE_ATLAS_HISTORY_TEST=1 node --conditions=react-server --env-file=.env.local --import tsx --test tests/history-integration.test.ts
 ```
 
 Packaging produces `dist/Converge-darwin-arm64/Converge.app`, an unsigned local Apple Silicon demo. Use `CONVERGE_APP_URL` during packaging for the public UI; the bundle includes its worker and trusted fixture/verifier. Credentials and workspaces remain external; `CONVERGE_ENV_FILE` and `CONVERGE_DATA_DIR` override their locations. Codex itself is not bundled.
