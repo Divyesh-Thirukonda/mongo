@@ -1,11 +1,15 @@
 import { hostname } from "node:os";
 import { randomUUID } from "node:crypto";
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
 import { CodexBridge, type CodexNotification, type CodexTurn } from "../lib/codex-bridge";
 import { classifyIntent } from "../lib/intent-router";
 import { buildContext, createCheckpoint } from "../lib/context";
-import { prepareWorkspace, verifyWorkspace } from "../lib/workspace-files";
+import { prepareWorkspace, verifyWorkspace, workspaceRoot } from "../lib/workspace-files";
 import { acquireLease, appendEvent, applyRouting, claimModelBudget, closeDatabase, completeRevision, database, getIntents, getSession, heartbeatWorker, incrementMetrics, pendingSessions, recordTrajectory, redact, releaseLease, renewLease, setMetrics, recordTokenUsage, snapshot, updateSession } from "../lib/store";
-import { captureWorkspace, commitSourceCheckpoint } from "../lib/source-checkpoint";
+import { captureWorkspace, commitSourceCheckpoint, readSourceCheckpoint, restoreWorkspaceFiles } from "../lib/source-checkpoint";
+import { loadHistoryRestore, completeHistoryRestore, failHistoryRestore, setHistoryRestoreBackup } from "../lib/history";
+import { publishWebsitePreview } from "../lib/website-preview";
 import type { Intent, Session } from "../lib/types";
 
 const owner=`${hostname()}:${randomUUID()}`;
@@ -17,6 +21,7 @@ const instructions=`You are the coding engine for CONVERGE, a collaborative inte
 
 async function routeQueued(id:string){
   let intents=await getIntents(id);
+  if((await getSession(id)).historyRequest)return intents;
   for(const intent of intents.filter(i=>i.status==='queued')){
     if(!(await claimModelBudget(id)))throw new Error('An hourly workspace, owner, or shared execution limit was reached. Your intent is saved; resume after the next hour.');
     const decision=await classifyIntent(intent,intents.filter(i=>i.revision<intent.revision));
@@ -29,6 +34,7 @@ async function routedSnapshot(id:string){
   // Keep routing until the snapshot's own revision has no unrouted inputs.
   // A later arrival remains a higher revision and cannot be marked complete.
   for(let attempt=0;attempt<70;attempt++){
+    if((await getSession(id)).historyRequest)return snapshot(id);
     await routeQueued(id);const state=await snapshot(id);
     if(!state.intents.some(i=>i.status==='queued'&&i.revision<=state.session.revision))return state;
   }
@@ -38,8 +44,69 @@ async function routedSnapshot(id:string){
 async function checkpoint(id:string,root:string){
   const state=await snapshot(id);
   const files=await captureWorkspace(root);
-  await commitSourceCheckpoint(id,owner,createCheckpoint(state.session,state.intents,state.events),files);
+  const saved=createCheckpoint(state.session,state.intents,state.events);
+  await commitSourceCheckpoint(id,owner,saved,files);
   await appendEvent(id,{kind:'checkpoint',actor:'Memory',title:`Checkpoint saved · revision ${state.session.revision}`,detail:'Active intent, attributed decisions, agent trajectory and source files are preserved in MongoDB Atlas.',intentIds:state.intents.filter(i=>i.status==='accepted'||i.status==='fulfilled').map(i=>i.id)});
+  return saved.id;
+}
+
+async function publishPreview(id:string,root:string){
+  try{const current=await getSession(id);if(!current.historyRequest)await publishWebsitePreview(id,owner,root,current.revision);}
+  catch(error){console.warn(`[${id.slice(0,8)}] Preview refresh: ${redact(error instanceof Error?error.message:'unavailable')}`);}
+}
+
+/** A queued restore never shares a filesystem with a still-running coding process. */
+async function applyQueuedRestore(id:string,root:string,bridge?:CodexBridge){
+  const current=await getSession(id);if(!current.historyRequest)return false;
+  const requestId=current.historyRequest.id;
+  await bridge?.close(); // Waits for child exit and drains all persisted notifications.
+  await updateSession(id,{activeTurnId:undefined},owner);
+  try{
+    const target=await loadHistoryRestore(id,owner);if(!target)return false;
+    // Persist the original undo point before touching files. A restarted worker
+    // must reuse it, not capture partially restored files with the old ledger.
+    let backupId=target.request.recoveryCheckpointId;
+    if(!backupId){
+      backupId=await checkpoint(id,root);
+      await setHistoryRestoreBackup(id,owner,requestId,backupId);
+    }
+    const backup=await readSourceCheckpoint(id,backupId);
+    if(!backup)throw new Error('The original restore recovery point is unavailable.');
+    const previous=backup.files;
+    await restoreWorkspaceFiles(root,target.files);
+    try{await completeHistoryRestore(id,owner,requestId);}
+    catch(error){
+      // A failed ledger transaction must not leave the displayed source on another branch.
+      const state=await getSession(id);
+      if(state.leaseOwner===owner&&state.leaseUntil&&state.leaseUntil>new Date().toISOString())await restoreWorkspaceFiles(root,previous);
+      throw error;
+    }
+    await checkpoint(id,root);
+    await publishPreview(id,root);
+    return true;
+  }catch(error){
+    await failHistoryRestore(id,owner,requestId,redact(error instanceof Error?error.message:'Checkpoint restore failed.')).catch(()=>{});
+    throw error;
+  }
+}
+
+async function refreshExistingPreviews(){
+  const records=await(await database()).collection<Session&{_id:string}>('cv_sessions').find({status:{$nin:['planning','running','review']},historyRequest:{$exists:false}}).sort({updatedAt:-1}).limit(20).toArray();
+  for(const record of records){
+    if(stopping||active.has(record.id))continue;
+    const root=join(workspaceRoot(),'workspaces',record.id);
+    if(!(await lstat(root).catch(()=>undefined))?.isDirectory())continue;
+    if(!(await acquireLease(record.id,owner)))continue;
+    try{
+      const current=await getSession(record.id);
+      if(!current.activeTurnId&&!current.historyRequest){
+        const saved=await readSourceCheckpoint(record.id).catch(()=>null);
+        if(!saved?.checkpoint.intentState)await checkpoint(record.id,root);
+      }
+      await publishPreview(record.id,root);
+    }catch(error){console.warn(`[${record.id.slice(0,8)}] Saved preview: ${redact(error instanceof Error?error.message:'unavailable')}`);}
+    finally{await releaseLease(record.id,owner);}
+  }
 }
 
 async function runSession(initial:Session){
@@ -51,9 +118,13 @@ async function runSession(initial:Session){
   let threadId:string|undefined;
   let root:string|undefined;
   let turnTools=0;
+  let lastPreview=0;
   try{
     root=await prepareWorkspace(id);
+    if(await applyQueuedRestore(id,root))return;
+    await publishPreview(id,root);
     let intents=await routeQueued(id);ensureLease();
+    if(await applyQueuedRestore(id,root))return;
     if(intents.some(i=>i.status==='blocked')){await updateSession(id,{status:'blocked',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
     let current=await getSession(id);
     if(current.pauseRequested)return;
@@ -87,6 +158,7 @@ async function runSession(initial:Session){
           const changes=Array.isArray(item.changes)?item.changes as Array<{path?:string;diff?:string}>:[];
           await appendEvent(id,{kind:'tool',actor:'Codex',title:'Code changes applied',detail:changes.map(c=>c.path??'workspace file').join('\n')||'Changes recorded in the shared workspace.',intentIds:[],turnId});
         }
+        if(root&&(item.type==='commandExecution'||item.type==='fileChange')&&Date.now()-lastPreview>1500){lastPreview=Date.now();await publishPreview(id,root);}
       }
     };
     bridge=new CodexBridge({cwd:root,onNotification,onServerRequest:async request=>{await appendEvent(id,{kind:'system',actor:'Harness',title:'Tool boundary enforced',detail:`The agent requested ${request.method}; this workspace does not grant broader tool access.`,intentIds:[]});}});
@@ -105,6 +177,7 @@ async function runSession(initial:Session){
     let repair=0,providerRetries=0,feedback='';
     while(!stopping){
       ensureLease();const routed=await routedSnapshot(id);intents=routed.intents;current=routed.session;
+      if(current.historyRequest){await applyQueuedRestore(id,root,bridge);return;}
       if(current.pauseRequested){await updateSession(id,{status:'paused',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
       if(intents.some(i=>i.status==='blocked')){await updateSession(id,{status:'blocked',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
       const state=routed;const context=buildContext(state.session,state.intents,state.checkpoints,state.events);
@@ -118,10 +191,13 @@ async function runSession(initial:Session){
       let done:CodexTurn|undefined;let turnError:unknown;
       const completion=bridge.waitForTurn(threadId,started.turn.id,240000).then(turn=>{done=turn;}).catch(error=>{turnError=error;});
       while(!done&&!turnError&&!stopping){
-        await delay(750);ensureLease();if(turnTools>24){await bridge.interrupt({threadId,turnId:started.turn.id}).catch(()=>{});throw new Error('This turn reached its 24-tool limit. The trajectory is saved; add guidance and retry.');}const latest=await getSession(id);
+        await delay(750);ensureLease();const latest=await getSession(id);
+        if(latest.historyRequest){await applyQueuedRestore(id,root,bridge);await completion;return;}
+        if(turnTools>24){await bridge.interrupt({threadId,turnId:started.turn.id}).catch(()=>{});throw new Error('This turn reached its 24-tool limit. The trajectory is saved; add guidance and retry.');}
         if(latest.pauseRequested){await bridge.interrupt({threadId,turnId:started.turn.id}).catch(()=>{});await completion;if(turnError)await bridge.close();await bridge.flushEvents();await updateSession(id,{status:'paused',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
         if(latest.revision!==sentRevision){
           const amended=await routedSnapshot(id);intents=amended.intents;
+          if(amended.session.historyRequest){await applyQueuedRestore(id,root,bridge);await completion;return;}
           if(intents.some(i=>i.status==='blocked')){await bridge.interrupt({threadId,turnId:started.turn.id}).catch(()=>{});await completion;if(turnError)await bridge.close();await bridge.flushEvents();await updateSession(id,{status:'blocked',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
           if(done||turnError)break;
           const nextContext=buildContext(amended.session,amended.intents,amended.checkpoints,amended.events);
@@ -141,6 +217,8 @@ async function runSession(initial:Session){
       }
       if(stopping){await bridge.close();await bridge.flushEvents();await checkpoint(id,root);await updateSession(id,{status:'planning',activeTurnId:undefined},owner);return;}
       await completion;await bridge.flushEvents();ensureLease();
+      if((await getSession(id)).historyRequest){await applyQueuedRestore(id,root,bridge);return;}
+      await publishPreview(id,root);
       if(turnError)throw turnError;
       if(done?.status==='failed'){
         const providerError=redact(JSON.stringify(done.error??{})).slice(0,600);
@@ -149,10 +227,12 @@ async function runSession(initial:Session){
         throw new Error('The coding provider failed twice. Your intent and trajectory are saved. '+providerError);
       }
       const latest=await getSession(id);
+      if(latest.historyRequest){await applyQueuedRestore(id,root,bridge);return;}
       if(latest.revision!==sentRevision){feedback='A new teammate intent arrived as the previous turn ended. Incorporate it into the existing work.';continue;}
       await updateSession(id,{status:'review',activeTurnId:undefined},owner);
       intents=await getIntents(id);
       const artifact=await verifyWorkspace(root,intents,sentRevision);
+      if((await getSession(id)).historyRequest){await applyQueuedRestore(id,root,bridge);return;}
       const passed=artifact.checks.filter(check=>check.passed).length;
       await updateSession(id,{artifact},owner);
       await setMetrics(id,{checksPassed:passed,checksTotal:artifact.checks.length},owner);
@@ -169,11 +249,15 @@ async function runSession(initial:Session){
       feedback=`The independent protected verifier found these failures. Fix the implementation and tests; do not alter requirements or claim success:\n${artifact.checks.filter(c=>!c.passed).map(c=>`${c.name}: ${c.detail}`).join('\n')}`;
     }
   }catch(error){
+    if(root&&leaseValid&&(await getSession(id).catch(()=>undefined))?.historyRequest){
+      try{await applyQueuedRestore(id,root,bridge);return;}catch(restoreError){error=restoreError;}
+    }
     const message=redact(error instanceof Error?error.message:'Worker failed').slice(0,1000);
     console.error(`[${id.slice(0,8)}] ${message}`);
     await bridge?.close();
     if(leaseValid){
       if(root)await checkpoint(id,root).catch(()=>{});
+      if(root)await publishPreview(id,root);
       await updateSession(id,{status:stopping?'planning':'error',activeTurnId:undefined,error:stopping?undefined:message},owner).catch(()=>{});
       await appendEvent(id,{kind:'system',actor:'Harness',title:stopping?'Worker stopped at a saved boundary':'Work needs attention',detail:stopping?'The shared session will resume when a worker reconnects.':message,intentIds:[]}).catch(()=>{});
     }
@@ -185,11 +269,14 @@ async function main(){
   const beat=setInterval(()=>{void heartbeatWorker(owner,'Codex App Server · OpenRouter',hostname()).catch(()=>{});},5000);
   await heartbeatWorker(owner,'Codex App Server · OpenRouter',hostname());
   try{
+    await refreshExistingPreviews();
+    let lastPreviewRefresh=Date.now();
     while(!stopping){
       for(const session of await pendingSessions()){
         if(active.size>=2)break;if(active.has(session.id))continue;
         const task=runSession(session).finally(()=>active.delete(session.id));active.set(session.id,task);
       }
+      if(Date.now()-lastPreviewRefresh>20000){lastPreviewRefresh=Date.now();await refreshExistingPreviews();}
       await delay(1200);
     }
     await Promise.allSettled(active.values());

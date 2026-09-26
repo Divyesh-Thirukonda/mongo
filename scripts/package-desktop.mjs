@@ -27,8 +27,12 @@ await cp(join(workspace, "scripts/verify-workspace.mjs"), join(runtime, "scripts
 await build({
   entryPoints: [join(workspace, "scripts/worker.ts")], outfile: join(runtime, "worker.cjs"),
   bundle: true, platform: "node", format: "cjs", target: "node22",
-  conditions: ["react-server"], external: ["mongodb"], sourcemap: false, logLevel: "warning",
+  conditions: ["react-server"], external: ["mongodb", "esbuild"], sourcemap: false, logLevel: "warning",
 });
+// Preview compilation needs esbuild's native helper; it cannot be inlined into worker.cjs.
+await cp(join(workspace, "node_modules/esbuild"), join(runtime, "node_modules/esbuild"), { recursive: true, filter: permitted });
+await mkdir(join(runtime, "node_modules/@esbuild"), { recursive: true });
+await cp(join(workspace, `node_modules/@esbuild/${process.platform}-${process.arch}`), join(runtime, `node_modules/@esbuild/${process.platform}-${process.arch}`), { recursive: true, filter: permitted });
 await access(join(runtime, "node_modules/mongodb/package.json")).catch(() => { throw new Error("The standalone output is missing mongodb. Ensure the server imports its database module before packaging."); });
 
 const manifest = JSON.parse(await readFile(join(workspace, "package.json"), "utf8"));
