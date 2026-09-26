@@ -52,9 +52,14 @@ try {
   assert.equal(newer.processedRevision,2);
   await assert.rejects(()=>updateSession(session.id,{status:'paused',pauseRequested:true},owner,2));
   assert.equal((await getSession(session.id)).pauseRequested,false);
+  await updateSession(session.id,{status:'error',error:'Verification failure',pauseRequested:true},owner);
+  await controlSession(session.id,'retry');
+  const retried=await getSession(session.id);
+  assert.equal(retried.status,'planning');assert.equal(retried.pauseRequested,false);
+  assert.equal(retried.error,undefined);assert.equal(retried.processedRevision,retried.revision-1);
   await releaseLease(session.id,owner);
   await assert.rejects(()=>commitSourceCheckpoint(session.id,owner,checkpoint,files));
-  console.log('PASS: Atlas concurrent idempotency, revision fence, single worker lease, atomic source checkpoint, deletion-preserving restore, token replay, pause boundary, attributed fulfillment, and stale review completion fencing.');
+  console.log('PASS: Atlas concurrent idempotency, revision fence, single worker lease, atomic source checkpoint, deletion-preserving restore, token replay, pause boundary, attributed fulfillment, and stale review completion fencing, and error retry scheduling.');
 } finally {
   const db=await database();
   for(const name of ['cv_intents','cv_events','cv_checkpoints','cv_source_checkpoints','cv_trajectory','cv_presence'])await db.collection(name).deleteMany({sessionId:session.id});
