@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { buildIntentGraph } from "../lib/intent-graph";
+import { buildIntentGraph, graphHistoryTarget } from "../lib/intent-graph";
 import type { Intent, SessionSnapshot, TrajectoryEvent } from "../lib/types";
 
 const at = (second: number) => new Date(Date.UTC(2026, 8, 26, 12, 0, second)).toISOString();
@@ -125,4 +125,42 @@ test("legacy external turn identifiers remain self-reported groups, including de
   assert.equal(graph.nodes[0].externalTrajectoryId, legacy.turnId);
   assert.ok(!graph.edges.some((edge) => edge.kind === "turn"));
   assert.equal(graph.edges.filter((edge) => edge.kind === "reported").length, 1);
+});
+
+
+test("history actions address source records, including checkpoint events versus saved checkpoints", () => {
+  const data = snapshot([intent("request-one", 1)], [event("checkpoint-event", 1, "checkpoint")]);
+  data.checkpoints = [{ id: "checkpoint-manifest", sessionId: "session", createdAt: at(22), revision: 1, summary: "Saved state", intentIds: ["request-one"], decisions: [], eventCount: 1, contextChars: 80, intentState: [] }];
+  const graph = buildIntentGraph(data, { compact: false });
+  assert.deepEqual(graphHistoryTarget(graph.nodes.find((node) => node.id === "intent:request-one")!), { type: "intent", id: "request-one" });
+  assert.deepEqual(graphHistoryTarget(graph.nodes.find((node) => node.id === "event:checkpoint-event")!), { type: "event", id: "checkpoint-event" });
+  assert.deepEqual(graphHistoryTarget(graph.nodes.find((node) => node.id === "checkpoint:checkpoint-manifest")!), { type: "checkpoint", id: "checkpoint-manifest" });
+  assert.throws(() => graphHistoryTarget({ id: "checkpoint:another-record", sourceId: "checkpoint-manifest" }), /matching source/);
+});
+
+
+test("structured history actions connect corrections and restores to their exact selected sources", () => {
+  const source = event("original-tool", 1, "tool");
+  const correction: TrajectoryEvent = { ...event("correction", 2, "system"), historyAction: { action: "revise", target: { type: "event", id: source.id }, requestId: "request-revise", fromRevision: 1, toRevision: 2 } };
+  const restore: TrajectoryEvent = { ...event("restore", 3, "system"), historyAction: { action: "restore", target: { type: "checkpoint", id: "saved-state" }, requestId: "request-restore", fromRevision: 2, toRevision: 3 } };
+  const data = snapshot([intent("original-request", 1)], [source, correction, restore]);
+  data.checkpoints = [{ id: "saved-state", sessionId: "session", createdAt: at(10), revision: 1, summary: "Saved state", intentIds: [], decisions: [], eventCount: 1, contextChars: 60 }];
+  const graph = buildIntentGraph(data);
+  assert.ok(graph.nodes.some((node) => node.id === "event:original-tool"), "overview keeps the selected source of a correction");
+  assert.equal(graph.nodes.find((node) => node.id === "event:correction")?.kind, "revision");
+  assert.equal(graph.nodes.find((node) => node.id === "event:restore")?.kind, "restore");
+  assert.deepEqual(graph.edges.filter((edge) => edge.kind === "history").map(({ from, to }) => ({ from, to })), [
+    { from: "event:original-tool", to: "event:correction" }, { from: "checkpoint:saved-state", to: "event:restore" },
+  ]);
+  assert.ok(graph.nodes.find((node) => node.id === "event:restore")?.references.some((reference) => reference.type === "checkpoint" && reference.id === "saved-state" && reference.available));
+});
+
+test("missing history sources stay explicit and connected reports cannot forge history-action edges", () => {
+  const missing: TrajectoryEvent = { ...event("missing-source", 1, "system"), historyAction: { action: "revise", target: { type: "intent", id: "not-loaded" }, requestId: "request-missing", fromRevision: 1, toRevision: 2 } };
+  const report: TrajectoryEvent = { ...event("report", 2, "agent"), source: "connected-agent", historyAction: { action: "restore", target: { type: "intent", id: "known" }, requestId: "untrusted", fromRevision: 2, toRevision: 3 } };
+  const graph = buildIntentGraph(snapshot([intent("known", 1)], [missing, report]));
+  assert.ok(!graph.edges.some((edge) => edge.kind === "history"));
+  assert.ok(graph.nodes.find((node) => node.id === "event:missing-source")?.warnings.some((warning) => warning.includes("outside this view")));
+  assert.equal(graph.nodes.find((node) => node.id === "event:report")?.historyAction, undefined);
+  assert.equal(graph.nodes.find((node) => node.id === "event:report")?.kind, "connected");
 });

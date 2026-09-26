@@ -1,16 +1,24 @@
 import { PEOPLE, type Intent, type Participant, type SessionSnapshot, type TrajectoryEvent } from "./types";
 
-export type GraphKind = "intent" | "turn" | "steer" | "resume" | "agent" | "tool" | "checkpoint" | "verification" | "routing" | "conflict" | "system" | "connected" | "reported-tool";
-export interface GraphReference { type: "intent" | "event"; id: string; available: boolean }
+export type GraphKind = "intent" | "turn" | "steer" | "resume" | "agent" | "tool" | "checkpoint" | "verification" | "routing" | "conflict" | "system" | "connected" | "reported-tool" | "revision" | "restore";
+export interface GraphReference { type: "intent" | "event" | "checkpoint"; id: string; available: boolean }
 export interface IntentGraphNode {
   id: string; sourceId: string; kind: GraphKind; laneId: string; title: string; detail: string;
   createdAt: string; actor: string; color: string; status?: string; revision?: number;
   turnId?: string; sequence?: number; relation?: string; references: GraphReference[];
-  source?: TrajectoryEvent["source"]; externalTrajectoryId?: string; actorUserId?: string;
+  source?: TrajectoryEvent["source"]; externalTrajectoryId?: string; actorUserId?: string; historyAction?: TrajectoryEvent["historyAction"];
   warnings: string[]; acceptance: string[]; x: number; y: number;
 }
+export interface GraphHistoryTarget { type: "intent" | "event" | "checkpoint"; id: string }
+/** Display kinds can overlap; mutations must address the original record collection. */
+export function graphHistoryTarget(node: Pick<IntentGraphNode, "id" | "sourceId">): GraphHistoryTarget {
+  const type = node.id.startsWith("intent:") ? "intent" : node.id.startsWith("checkpoint:") ? "checkpoint" : "event";
+  if (node.id !== `${type}:${node.sourceId}`) throw new Error("Graph history target has no matching source record.");
+  return { type, id: node.sourceId };
+}
+
 export interface IntentGraphEdge {
-  id: string; from: string; to: string; kind: "dependency" | "intent" | "turn" | "source" | "timeline" | "reported"; label: string;
+  id: string; from: string; to: string; kind: "dependency" | "intent" | "turn" | "source" | "timeline" | "reported" | "history"; label: string;
 }
 export interface IntentGraphLane { id: string; name: string; initials: string; color: string; x: number }
 export interface IntentGraphData {
@@ -46,6 +54,7 @@ function group(event: TrajectoryEvent): string | undefined {
 }
 function eventKind(event: TrajectoryEvent): GraphKind {
   if (isConnected(event)) return event.kind === "tool" ? "reported-tool" : "connected";
+  if (event.historyAction) return event.historyAction.action === "restore" ? "restore" : "revision";
   if (event.kind === "merge") return event.turnId ? "steer" : "routing";
   if (event.kind === "intent") return "routing";
   if (event.kind === "agent" && /^(Working from the shared plan|Repairing against measured checks)$/.test(event.title)) return "turn";
@@ -65,8 +74,9 @@ export function buildIntentGraph(snapshot: SessionSnapshot, options: { compact?:
   const shownCheckpoints = checkpoints.slice(-16);
   const anchors = new Map<string, string>();
   for (const event of recentEvents) { const key = group(event); if (key && !anchors.has(key)) anchors.set(key, event.id); }
+  const historyEventTargets = new Set(recentEvents.filter((event) => !isConnected(event) && event.historyAction?.target.type === "event").map((event) => event.historyAction!.target.id));
   const events = recentEvents.filter((event) => {
-    if (!compact) return true;
+    if (!compact || historyEventTargets.has(event.id)) return true;
     const key = group(event);
     if (key && anchors.get(key) === event.id) return true;
     const kind = eventKind(event);
@@ -83,7 +93,8 @@ export function buildIntentGraph(snapshot: SessionSnapshot, options: { compact?:
   const edges: IntentGraphEdge[] = [];
   const intentIds = new Set(intents.map((intent) => intent.id));
   const eventIds = new Set(events.map((event) => event.id));
-  const reference = (type: GraphReference["type"], id: string): GraphReference => ({ type, id, available: (type === "intent" ? intentIds : eventIds).has(id) });
+  const checkpointIds = new Set(shownCheckpoints.map((checkpoint) => checkpoint.id));
+  const reference = (type: GraphReference["type"], id: string): GraphReference => ({ type, id, available: (type === "intent" ? intentIds : type === "checkpoint" ? checkpointIds : eventIds).has(id) });
   for (const intent of intents) {
     const lane = laneMap.get(`author:${intent.authorId}`)!;
     const parents = [...new Set(intent.decision?.parentIntentIds ?? [])];
@@ -98,12 +109,18 @@ export function buildIntentGraph(snapshot: SessionSnapshot, options: { compact?:
     const connected = isConnected(event);
     const reporter = connected && event.actorUserId ? participant(event.actorUserId, snapshot.participants ?? []).name : undefined;
     const references = [...new Set(event.intentIds)].map((id) => reference("intent", id));
+    const historyAction = connected ? undefined : event.historyAction;
+    if (historyAction && !references.some((item) => item.type === historyAction.target.type && item.id === historyAction.target.id)) references.push(reference(historyAction.target.type, historyAction.target.id));
     nodes.push({ id: `event:${event.id}`, sourceId: event.id, kind, laneId: connected ? "connected" : "execution", title: event.title, detail: event.detail,
       createdAt: event.createdAt, actor: reporter ? `Connected Codex · ${reporter}` : event.actor, color: connected ? CONNECTED_COLOR : kind === "conflict" ? "#b47c61" : EXECUTION_COLOR,
       turnId: connected ? undefined : event.turnId, source: connected ? "connected-agent" : event.source,
-      externalTrajectoryId: connected ? externalTrajectory(event) : undefined, actorUserId: event.actorUserId,
+      externalTrajectoryId: connected ? externalTrajectory(event) : undefined, actorUserId: event.actorUserId, historyAction,
       sequence: event.sequence, acceptance: [], references, warnings: [], x: connected ? 76 : 38, y: 0 });
-    for (const ref of references) if (ref.available) edges.push({ id: `intent-event:${ref.id}:${event.id}`, from: `intent:${ref.id}`, to: `event:${event.id}`, kind: "intent", label: kind === "steer" ? "included in acknowledged steer" : "referenced intent" });
+    for (const ref of references) if (ref.type === "intent" && ref.available) edges.push({ id: `intent-event:${ref.id}:${event.id}`, from: `intent:${ref.id}`, to: `event:${event.id}`, kind: "intent", label: kind === "steer" ? "included in acknowledged steer" : "referenced intent" });
+    if (historyAction) {
+      const target = references.find((item) => item.type === historyAction.target.type && item.id === historyAction.target.id);
+      if (target?.available) edges.push({ id: `history:${target.type}:${target.id}:${event.id}`, from: `${target.type}:${target.id}`, to: `event:${event.id}`, kind: "history", label: `${historyAction.action === "restore" ? "restores" : "revises"} selected ${target.type} · r${historyAction.fromRevision} → r${historyAction.toRevision}` });
+    }
     const key = group(event), anchor = key ? anchors.get(key) : undefined;
     if (anchor && anchor !== event.id && eventIds.has(anchor)) edges.push({ id: `${connected ? "reported" : "turn"}:${anchor}:${event.id}`, from: `event:${anchor}`, to: `event:${event.id}`, kind: connected ? "reported" : "turn", label: connected ? `self-reported group · ${externalTrajectory(event)}` : `same turn · ${event.turnId}` });
   }
