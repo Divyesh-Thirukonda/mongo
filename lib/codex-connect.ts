@@ -4,7 +4,8 @@ import {z} from 'zod';
 import {consumeRateLimit,requireMembership} from './access';
 import {appendEvent,database,snapshot,StoreError,redact} from './store';
 import {buildContext} from './context';
-import type {Identity} from './types';
+import type {Identity,Session,Intent} from './types';
+import {readSourceCheckpoint} from './source-checkpoint';
 export interface AgentConnection {_id:string;sessionId:string;userId:string;createdAt:Date;expiresAt:Date}
 export function agentTokenHash(token:string):string{
  if(!/^cvg_[A-Za-z0-9_-]{43}$/.test(token))throw new StoreError('Invalid Codex connection.',401);
@@ -36,14 +37,28 @@ export async function authenticateAgent(request:Request):Promise<AgentConnection
 export const progressSchema=z.object({
  title:z.string().trim().min(1).max(180),detail:z.string().max(6000),
  kind:z.enum(['agent','tool']).default('agent'),intentIds:z.array(z.string().uuid()).max(64).default([]),
+ expectedRevision:z.number().int().nonnegative().optional(),
  trajectoryId:z.string().regex(/^[a-zA-Z0-9_-]{1,100}$/).optional(),
 }).strict();
+export function collaborationStatus(session:Session,intents:Intent[]){
+ const conflicts=intents.filter(i=>i.status==='blocked').map(i=>({id:i.id,text:i.text,reason:i.decision?.reason,relatedIntentIds:i.decision?.parentIntentIds??[]}));
+ const reason=session.historyRequest?'A checkpoint restore is pending.':conflicts.length?'Human conflict resolution is required.':session.pauseRequested||session.status==='paused'?'The shared session is paused.':session.activeTurnId?'The managed worker is editing the shared workspace.':intents.some(i=>i.status==='queued')?'New requests are still being classified.':null;
+ return {revision:session.revision,status:session.status,shouldWait:Boolean(reason),reason,conflicts,pendingRestore:session.historyRequest?{checkpointId:session.historyRequest.checkpointId}:null,permissions:{readContext:true,readCheckpoints:true,reportProgress:true,editSharedFiles:false,resolveConflicts:false,restoreCheckpoints:false},localFiles:'Local Codex filesystem permissions are controlled by that Codex task. This connection does not grant or enforce them.'};
+}
 export async function sharedContext(connection:AgentConnection){
  const state=await snapshot(connection.sessionId);const context=buildContext(state.session,state.intents,state.checkpoints,state.events);
- return {sessionId:state.session.id,name:state.session.name,revision:state.session.revision,status:state.session.status,context:context.text,contextChars:context.chars,latestSequence:state.events.at(-1)?.sequence??0,instructions:'Preserve every accepted or fulfilled requirement. Blocked requests require human resolution. Report actual progress using report_progress; these reports do not assert protected verification or mark requirements complete.'};
+ return {authenticated:true,connectedAs:connection.userId,connectionExpiresAt:connection.expiresAt.toISOString(),sessionId:state.session.id,name:state.session.name,revision:state.session.revision,status:state.session.status,control:collaborationStatus(state.session,state.intents),context:context.text,contextChars:context.chars,latestSequence:state.events.at(-1)?.sequence??0,checkpoints:state.checkpoints.map(c=>({id:c.id,revision:c.revision,summary:c.summary,restorable:c.restorable})),instructions:'Preserve every accepted or fulfilled requirement. Check control.shouldWait before edits and at work boundaries; report blockers and ask a human to resolve conflicts in Converge. Read checkpoints to recover saved source in a new task. Work only in the repository explicitly selected by the user, never a managed worker directory. Reports cannot resolve conflicts, replace code, or mark requirements complete.'};
+}
+export async function agentCheckpoint(connection:AgentConnection,checkpointId?:string,path?:string){
+ const saved=await readSourceCheckpoint(connection.sessionId,checkpointId);
+ if(!saved)throw new StoreError('No source checkpoint has been saved yet.',404);
+ const file=path?saved.files.find(file=>file.path===path):undefined;
+ if(path&&!file)throw new StoreError('This file is not in the selected checkpoint.',404);
+ return {sessionId:connection.sessionId,checkpoint:saved.checkpoint,files:saved.files.map(({path,sha256,content})=>({path,sha256,bytes:Buffer.byteLength(content)})),...(file?{file}:{})};
 }
 export async function reportAgentProgress(connection:AgentConnection,input:unknown){
  const data=progressSchema.parse(input);const state=await snapshot(connection.sessionId);
+ if(data.expectedRevision!==undefined&&data.expectedRevision!==state.session.revision)throw new StoreError('The workspace changed. Read shared context before reporting against the new revision.',409);
  const allowed=new Set(state.intents.map(i=>i.id));if(data.intentIds.some(id=>!allowed.has(id)))throw new StoreError('A progress report references an intent outside this session.',400);
  const trajectoryId=`external-${connection._id.slice(0,12)}-${data.trajectoryId??'codex'}`;
  await appendEvent(connection.sessionId,{kind:data.kind,actor:'Codex · connected',title:data.title,detail:data.detail,intentIds:data.intentIds,source:'connected-agent',externalTrajectoryId:trajectoryId,actorUserId:connection.userId});

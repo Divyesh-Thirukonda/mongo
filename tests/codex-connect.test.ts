@@ -15,3 +15,14 @@ test('external reports cannot claim protected verification, inject extra fields,
  assert.equal(progressSchema.safeParse({title:'Work',detail:'result',actorUserId:'another-person'}).success,false);
  assert.equal(progressSchema.safeParse({title:'Edited adapter',detail:'Pagination implemented',kind:'tool'}).success,true);
 });
+
+test('connection status exposes conflicts and pause/restore barriers without granting shared writes',async()=>{
+ const {collaborationStatus}=await import('../lib/codex-connect');
+ const session={id:'session',revision:4,status:'running'} as import('../lib/types').Session;
+ const intent={id:'conflict',status:'blocked',text:'Choose a theme',decision:{reason:'Two themes conflict',parentIntentIds:['earlier']}} as import('../lib/types').Intent;
+ const blocked=collaborationStatus(session,[intent]);assert.equal(blocked.shouldWait,true);assert.equal(blocked.conflicts[0].id,'conflict');assert.equal(blocked.permissions.editSharedFiles,false);
+ assert.equal(collaborationStatus({...session,pauseRequested:true},[]).shouldWait,true);
+ assert.equal(collaborationStatus({...session,historyRequest:{id:'restore',checkpointId:'saved',authorId:'user',createdAt:'now',revision:4}},[]).shouldWait,true);
+ assert.equal(collaborationStatus({...session,activeTurnId:'turn'},[]).shouldWait,true);
+ assert.equal(collaborationStatus({...session,status:'idle'},[]).shouldWait,false);
+});

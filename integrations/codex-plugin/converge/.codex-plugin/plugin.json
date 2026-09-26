@@ -1,6 +1,6 @@
 {
   "name": "converge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Use the shared Converge intent graph and durable team context from Codex.",
   "author": {
     "name": "Converge"
