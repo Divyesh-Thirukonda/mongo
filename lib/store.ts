@@ -3,6 +3,7 @@ import { MongoClient, type ClientSession, type Db } from "mongodb";
 import { randomUUID, createHash } from "node:crypto";
 import type { Intent, PersonId, Session, SessionSnapshot, TrajectoryEvent, MemoryCheckpoint, Presence, RoutingDecision } from "./types";
 import { buildPlan } from "./intent-router";
+import { modelBudgetScopes, reserveModelBudgetScopes } from "./model-budget";
 
 type SessionDoc = Session & { _id: string; eventSequence: number };
 type IntentDoc = Intent & { _id: string; requestId: string };
@@ -28,6 +29,7 @@ export async function database(): Promise<Db> {
     db.collection("cv_trajectory").createIndex({sessionId:1,turnId:1,createdAt:1}),
     db.collection("cv_presence").createIndex({expiresAt:1},{expireAfterSeconds:0}),
     db.collection("cv_workers").createIndex({seenAt:1},{expireAfterSeconds:120}),
+    db.collection("cv_budgets").createIndex({expiresAt:1},{expireAfterSeconds:0}),
   ]).then(()=>undefined).catch(()=>{pool.convergeInitialized=undefined;throw new StoreError("Atlas collection initialization failed.");});
   await pool.convergeInitialized; return db;
 }
@@ -155,8 +157,17 @@ export async function recordTrajectory(sessionId:string,turnId:string|undefined,
   const chunks=raw.match(/[\s\S]{1,200000}/g)??[""];
   await(await database()).collection<{_id:string;sessionId:string;turnId?:string;method:string;data:string;chunk:number;chunks:number;createdAt:Date}>("cv_trajectory").bulkWrite(chunks.map((data,index)=>({updateOne:{filter:{_id:`${digest}:${index}`},update:{$setOnInsert:{sessionId,turnId,method,data,chunk:index,chunks:chunks.length,createdAt:new Date()}},upsert:true}})));
 }
-export async function claimModelBudget(limit=100):Promise<boolean>{
-  const db=await database();const key=`model:${Math.floor(Date.now()/3600000)}`;
-  const result=await db.collection<{_id:string;count:number}>("cv_budgets").findOneAndUpdate({_id:key},{$inc:{count:1}},{upsert:true,returnDocument:"after"});return Boolean(result&&result.count<=limit);
+export async function claimModelBudget(sessionId:string):Promise<boolean>{
+  for(let attempt=0;attempt<5;attempt++){
+    try{return await transaction(async(db,tx)=>{
+      const session=await sessions(db).findOne({_id:sessionId},{session:tx});if(!session)throw new StoreError("Session not found",404);
+      const at=Date.now();return reserveModelBudgetScopes(db,tx,modelBudgetScopes(session,at),at);
+    });}catch(error){
+      // Simultaneous first claims can collide on an absent counter's unique ID.
+      // The failed transaction consumed nothing; retry against the winning row.
+      if(attempt===4||!error||typeof error!=="object"||!("code"in error)||error.code!==11000)throw error;
+    }
+  }
+  return false;
 }
 export async function closeDatabase(){if(pool.convergeClient)await(await pool.convergeClient).close();pool.convergeClient=undefined;pool.convergeInitialized=undefined;}
