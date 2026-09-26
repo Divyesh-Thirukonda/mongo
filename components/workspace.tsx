@@ -29,7 +29,7 @@ function initials(name: string) { return name.trim().split(/\s+/).slice(0, 2).ma
 function shortTime(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? "" : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); }
 function shortDate(value: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? "" : date.toLocaleDateString([], { month: "short", day: "numeric" }); }
 function Avatar({ participant, small = false }: { participant: Pick<Participant, "name" | "initials" | "color">; small?: boolean }) { return <span title={participant.name} className={`avatar ${small ? "small" : ""}`} style={{ "--avatar-color": participant.color } as React.CSSProperties}>{participant.initials}</span>; }
-function ConvergeMark({ size = 24 }: { size?: number }) { return <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M7 6v5c0 6 5 10 13 10h5M7 26v-5c0-6 5-10 13-10h5" stroke="currentColor" strokeWidth="2.7" strokeLinecap="round"/><path d="m21 7 4 4-4 4m0 2 4 4-4 4" stroke="currentColor" strokeWidth="2.7" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
+function ConvergeMark({ size = 24 }: { size?: number }) { return <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true"><path d="M5 5c8 0 8 11 16 11M5 16h22M5 27c8 0 8-11 16-11m1-5 5 5-5 5" stroke="currentColor" strokeWidth="2.7" strokeLinecap="round" strokeLinejoin="round"/></svg>; }
 
 export default function Workspace() {
   const [user, setUser] = useState<IdentityUser | null>(null);
