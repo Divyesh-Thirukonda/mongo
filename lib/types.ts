@@ -1,3 +1,5 @@
+import type { HarnessState, IncidentVariant } from "./harness-types";
+
 export type ScenarioId = "ransomware" | "supply-chain" | "exfiltration";
 export type AgentId = "sentinel" | "cipher" | "bastion" | "trace" | "nexus";
 export type NodeStatus = "healthy" | "exposed" | "compromised" | "isolated";
@@ -63,6 +65,10 @@ export interface RunMetrics {
 export interface SimulationRun {
   id: string;
   scenarioId: ScenarioId;
+  variant?: IncidentVariant;
+  memoryScope?: string;
+  campaign?: { id: string; episode: number };
+  harness?: HarnessState;
   status: RunStatus;
   tick: number;
   seed: number;
@@ -114,6 +120,19 @@ export interface DefensePolicy {
       accepted: boolean;
       baselineIntegrity: number;
       candidateIntegrity: number;
+      validation?: {
+        seeds: number[];
+        cases: Array<{
+          seed: number;
+          baselineScore: number;
+          candidateScore: number;
+          baselineIntegrity: number;
+          candidateIntegrity: number;
+        }>;
+        meanBaselineScore: number;
+        meanCandidateScore: number;
+        noRegression: boolean;
+      };
     };
   };
 }

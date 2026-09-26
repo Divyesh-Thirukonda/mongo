@@ -7,7 +7,10 @@
     "build": "next build",
     "start": "next start --hostname 0.0.0.0",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "node --conditions=react-server --import tsx --test tests/*.test.ts",
+    "campaign": "tsx scripts/campaign.ts",
+    "memory:export": "node --conditions=react-server --env-file=.env.local --import tsx scripts/memory-git.ts export",
+    "memory:import": "node --conditions=react-server --env-file=.env.local --import tsx scripts/memory-git.ts import"
   },
   "dependencies": {
     "@react-three/drei": "10.7.9",

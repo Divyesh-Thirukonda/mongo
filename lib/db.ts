@@ -1,6 +1,8 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { MongoClient, type Db } from "mongodb";
+import { buildIncidentMemory } from "./incident-memory";
+import type { Campaign, IncidentMemory } from "./harness-types";
 import { baselinePolicy, derivePolicy } from "./simulation";
 import { SCENARIOS } from "./scenarios";
 import type {
@@ -12,7 +14,7 @@ import type {
 
 type RunDoc = SimulationRun & {
   _id: string;
-  expiresAt: Date;
+  expiresAt?: Date;
   leaseToken?: string;
   leaseUntil?: Date;
 };
@@ -21,6 +23,9 @@ type BudgetDoc = { _id: string; count: number; expiresAt: Date };
 type Store = {
   client?: Promise<MongoClient>;
   initialized?: Promise<void>;
+  initializedVersion?: number;
+  memories: Map<string, IncidentMemory>;
+  campaigns: Map<string, Campaign>;
   runs: Map<string, SimulationRun>;
   policies: Map<string, DefensePolicy>;
   locks: Set<string>;
@@ -28,11 +33,16 @@ type Store = {
 };
 const globalStore = globalThis as typeof globalThis & { aegisStore?: Store };
 const store: Store = (globalStore.aegisStore ??= {
+  memories: new Map(),
+  campaigns: new Map(),
   runs: new Map(),
   policies: new Map(),
   locks: new Set(),
   budgets: new Map(),
 });
+
+store.memories ??= new Map();
+store.campaigns ??= new Map();
 
 export class StoreError extends Error {
   constructor(
@@ -69,13 +79,31 @@ async function database(): Promise<Db | null> {
   }
   const client = await store.client;
   const db = client.db(process.env.MONGODB_DB ?? "aegis");
+  if (store.initializedVersion !== 3) {
+    store.initialized = undefined;
+    store.initializedVersion = 3;
+  }
   if (!store.initialized) {
     store.initialized = Promise.all([
+      db
+        .collection("incident_memories")
+        .createIndex({ scope: 1, scenarioId: 1, createdAt: -1 }),
+      db.collection("incident_memories").createIndex({
+        scope: 1,
+        scenarioId: 1,
+        outcome: 1,
+        "metrics.integrity": -1,
+      }),
+      db.collection("campaigns").createIndex({ createdAt: -1 }),
+      db.collection("policies").createIndex({ scenarioId: 1 }),
       db.collection("runs").createIndex({ createdAt: -1 }),
       db
         .collection("runs")
         .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
       db.collection("events").createIndex({ runId: 1, tick: 1 }),
+      db
+        .collection("events")
+        .createIndex({ runId: 1, eventId: 1 }, { unique: true }),
       db
         .collection("events")
         .createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
@@ -170,22 +198,33 @@ export async function insertRun(run: SimulationRun): Promise<void> {
     store.runs.set(run.id, structuredClone(run));
     return;
   }
-  await db
-    .collection<RunDoc>("runs")
-    .insertOne({
-      ...run,
-      _id: run.id,
-      expiresAt: new Date(Date.now() + 7 * 86400_000),
-    });
+  await db.collection<RunDoc>("runs").insertOne({
+    ...run,
+    _id: run.id,
+    ...(run.campaign
+      ? {}
+      : { expiresAt: new Date(Date.now() + 7 * 86400_000) }),
+  });
   // Every event also lives inside the atomic run snapshot; this collection is a queryable evidence projection.
   await writeEvents(db, run);
 }
 
 export async function getRun(id: string): Promise<SimulationRun | null> {
   const db = await database();
-  if (!db) return structuredClone(store.runs.get(id) ?? null);
-  const run = await db.collection<RunDoc>("runs").findOne({ _id: id });
-  return run ? clean(run) : null;
+  const doc = db
+    ? await db.collection<RunDoc>("runs").findOne({ _id: id })
+    : null;
+  const run = db
+    ? doc
+      ? clean(doc)
+      : null
+    : structuredClone(store.runs.get(id) ?? null);
+  // Repair interrupted finalization from a committed terminal snapshot.
+  if (run && !run.learned && ["contained", "breached"].includes(run.status)) {
+    await learn(run, db);
+    if (!db) store.runs.set(id, structuredClone(run));
+  }
+  return run;
 }
 
 export async function listRuns(): Promise<SimulationRun[]> {
@@ -207,70 +246,236 @@ export async function listRuns(): Promise<SimulationRun[]> {
 
 export async function getPolicy(
   scenarioId: ScenarioId,
+  scope = "shared",
 ): Promise<DefensePolicy> {
+  const key = policyKey(scope, scenarioId);
   const db = await database();
   if (!db)
     return structuredClone(
-      store.policies.get(scenarioId) ?? baselinePolicy(scenarioId),
+      store.policies.get(key) ?? baselinePolicy(scenarioId),
     );
   const policy = await db
     .collection<PolicyDoc>("policies")
-    .findOne({ _id: scenarioId });
+    .findOne({ _id: key });
   if (!policy) return baselinePolicy(scenarioId);
   const { _id: _id, ...result } = policy;
   return result;
 }
 
-export async function listPolicies(): Promise<DefensePolicy[]> {
-  return Promise.all(SCENARIOS.map((scenario) => getPolicy(scenario.id)));
+export async function listPolicies(scope = "shared"): Promise<DefensePolicy[]> {
+  return Promise.all(
+    SCENARIOS.map((scenario) => getPolicy(scenario.id, scope)),
+  );
+}
+
+export function validateMemoryScope(scope: string): string {
+  if (!/^[a-z0-9][a-z0-9-]{0,79}$/.test(scope))
+    throw new StoreError("Invalid memory scope", 400);
+  return scope;
+}
+function policyKey(scope: string, scenarioId: ScenarioId): string {
+  validateMemoryScope(scope);
+  return scope === "shared" ? scenarioId : `${scope}:${scenarioId}`;
+}
+
+type MemoryDoc = IncidentMemory & { _id: string };
+function memoryKey(memory: Pick<IncidentMemory, "scope" | "id">) {
+  return `${memory.scope}:${memory.id}`;
+}
+function cleanMemory(doc: MemoryDoc): IncidentMemory {
+  const { _id, ...memory } = doc;
+  return memory;
+}
+
+export async function listIncidentMemories(
+  scope = "shared",
+  limit = 200,
+  scenarioId?: ScenarioId,
+): Promise<IncidentMemory[]> {
+  validateMemoryScope(scope);
+  const cap = Math.max(1, Math.min(200, Math.floor(limit)));
+  const db = await database();
+  if (!db)
+    return [...store.memories.values()]
+      .filter(
+        (m) =>
+          m.scope === scope && (!scenarioId || m.scenarioId === scenarioId),
+      )
+      .sort(
+        (a, b) =>
+          b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id),
+      )
+      .slice(0, cap)
+      .map((m) => structuredClone(m));
+  return (
+    await db
+      .collection<MemoryDoc>("incident_memories")
+      .find({ scope, ...(scenarioId ? { scenarioId } : {}) })
+      .sort({ createdAt: -1, _id: 1 })
+      .limit(cap)
+      .toArray()
+  ).map(cleanMemory);
+}
+
+export async function importIncidentMemories(
+  memories: IncidentMemory[],
+  scope = "shared",
+): Promise<{ inserted: number; existing: number }> {
+  validateMemoryScope(scope);
+  if (memories.length > 200 || memories.some((m) => m.scope !== scope))
+    throw new StoreError("Memory import scope or size mismatch", 400);
+  const db = await database();
+  // Compare normalized JSON independent of object-key insertion order.
+  const canonical = (value: unknown): string =>
+    JSON.stringify(value, function (_key, item) {
+      return item && typeof item === "object" && !Array.isArray(item)
+        ? Object.fromEntries(
+            Object.entries(item).sort(([a], [b]) => a.localeCompare(b)),
+          )
+        : item;
+    });
+  if (new Set(memories.map(memoryKey)).size !== memories.length)
+    throw new StoreError("Duplicate memory identity in import", 400);
+  if (!db) {
+    let existing = 0;
+    // Preflight the whole batch before mutating the local adapter.
+    for (const memory of memories) {
+      const key = memoryKey(memory);
+      const prior = store.memories.get(key);
+      if (prior && canonical(prior) !== canonical(memory))
+        throw new StoreError("Conflicting immutable memory ID", 409);
+      if (prior) existing++;
+    }
+    for (const memory of memories) {
+      if (!store.memories.has(memoryKey(memory)))
+        store.memories.set(memoryKey(memory), structuredClone(memory));
+    }
+    return { inserted: memories.length - existing, existing };
+  }
+  const client = await store.client!;
+  return client.withSession((session) =>
+    session.withTransaction(
+      async () => {
+        // Counters belong to the transaction attempt; retries must not double-count.
+        let inserted = 0,
+          existing = 0;
+        const collection = db.collection<MemoryDoc>("incident_memories");
+        for (const memory of memories) {
+          const key = memoryKey(memory);
+          const prior = await collection.findOne({ _id: key }, { session });
+          if (prior) {
+            if (canonical(cleanMemory(prior)) !== canonical(memory))
+              throw new StoreError("Conflicting immutable memory ID", 409);
+            existing++;
+          } else {
+            await collection.insertOne({ ...memory, _id: key }, { session });
+            inserted++;
+          }
+        }
+        return { inserted, existing };
+      },
+      { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } },
+    ),
+  );
+}
+
+/** Mix recent cases with durable successes and failures so old lessons survive a busy incident stream. */
+export async function recallCandidates(
+  scope: string,
+  scenarioId: ScenarioId,
+): Promise<IncidentMemory[]> {
+  validateMemoryScope(scope);
+  const db = await database();
+  if (!db) {
+    const all = [...store.memories.values()].filter(
+      (m) => m.scope === scope && m.scenarioId === scenarioId,
+    );
+    const recent = [...all]
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 24);
+    const anchors = [...all]
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(0, 5);
+    const failures = all.filter((m) => m.outcome === "breached").slice(-5);
+    return [
+      ...new Map(
+        [...recent, ...anchors, ...failures].map((m) => [m.id, m]),
+      ).values(),
+    ].map((m) => structuredClone(m));
+  }
+  const collection = db.collection<MemoryDoc>("incident_memories");
+  const filter = { scope, scenarioId };
+  const groups = await Promise.all([
+    collection.find(filter).sort({ createdAt: -1 }).limit(24).toArray(),
+    collection.find(filter).sort({ createdAt: 1 }).limit(5).toArray(),
+    collection
+      .find({ ...filter, outcome: "contained" })
+      .sort({ "metrics.integrity": -1, createdAt: -1 })
+      .limit(5)
+      .toArray(),
+    collection
+      .find({ ...filter, outcome: "breached" })
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .toArray(),
+  ]);
+  return [
+    ...new Map(
+      groups.flat().map((doc) => [doc._id, cleanMemory(doc)]),
+    ).values(),
+  ];
 }
 
 async function learn(run: SimulationRun, db: Db | null): Promise<void> {
   if (run.learned || !["contained", "breached"].includes(run.status)) return;
+  const scope = validateMemoryScope(run.memoryScope ?? "shared");
+  const key = policyKey(scope, run.scenarioId);
+  const incidentKey = `${scope}:${run.id}`;
   if (!db) {
-    const policy =
-      store.policies.get(run.scenarioId) ?? baselinePolicy(run.scenarioId);
-    store.policies.set(run.scenarioId, derivePolicy(run, policy));
+    if (!store.memories.has(incidentKey)) {
+      const policy = store.policies.get(key) ?? baselinePolicy(run.scenarioId);
+      const next = derivePolicy(run, policy);
+      store.memories.set(incidentKey, buildIncidentMemory(run, next));
+      store.policies.set(key, next);
+    }
     run.learned = true;
     return;
   }
-  const collection = db.collection<PolicyDoc>("policies");
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const previous = await collection.findOne({ _id: run.scenarioId });
-    const next = derivePolicy(run, previous ?? baselinePolicy(run.scenarioId));
-    if (previous?.learnedFrom.includes(run.id)) {
-      run.learned = true;
-      return;
-    }
-    if (previous) {
-      const result = await collection.replaceOne(
-        { _id: run.scenarioId, version: previous.version },
-        next,
-      );
-      if (result.modifiedCount) {
-        run.learned = true;
-        return;
-      }
-    } else {
-      try {
-        await collection.insertOne({ ...next, _id: run.scenarioId });
-        run.learned = true;
-        return;
-      } catch (error) {
-        if (!(
-          error &&
-          typeof error === "object" &&
-          "code" in error &&
-          error.code === 11000
-        ))
-          throw error;
-      }
-    }
-  }
-  throw new StoreError(
-    "The learned policy was being updated by another exercise. Please retry.",
-    409,
-  );
+  const client = await store.client!;
+  await client.withSession(async (session) => {
+    await session.withTransaction(
+      async () => {
+        const memories = db.collection<MemoryDoc>("incident_memories");
+        const alreadyLearned = await memories.findOne(
+          { _id: incidentKey },
+          { session },
+        );
+        if (!alreadyLearned) {
+          const collection = db.collection<PolicyDoc>("policies");
+          const previous = await collection.findOne({ _id: key }, { session });
+          const next = derivePolicy(
+            run,
+            previous ?? baselinePolicy(run.scenarioId),
+          );
+          const memory = buildIncidentMemory(run, next);
+          await memories.insertOne(
+            { ...memory, _id: incidentKey },
+            { session },
+          );
+          await collection.replaceOne(
+            { _id: key },
+            { ...next },
+            { upsert: true, session },
+          );
+        }
+        await db
+          .collection<RunDoc>("runs")
+          .updateOne({ _id: run.id }, { $set: { learned: true } }, { session });
+      },
+      { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } },
+    );
+  });
+  run.learned = true;
 }
 
 /** Leases serialize per-run mutations across serverless instances and protect paid AI calls. */
@@ -395,4 +600,109 @@ export async function claimBudget(
       return false;
     throw error;
   }
+}
+
+type CampaignDoc = Campaign & {
+  _id: string;
+  leaseToken?: string;
+  leaseUntil?: Date;
+};
+function cleanCampaign(doc: CampaignDoc): Campaign {
+  const { _id, leaseToken, leaseUntil, ...campaign } = doc;
+  return campaign;
+}
+export async function insertCampaign(campaign: Campaign): Promise<void> {
+  const db = await database();
+  if (!db) {
+    if (store.campaigns.has(campaign.id))
+      throw new StoreError("Campaign already exists", 409);
+    store.campaigns.set(campaign.id, structuredClone(campaign));
+    return;
+  }
+  await db
+    .collection<CampaignDoc>("campaigns")
+    .insertOne({ ...campaign, _id: campaign.id });
+}
+export async function getCampaign(id: string): Promise<Campaign | null> {
+  const db = await database();
+  if (!db) return structuredClone(store.campaigns.get(id) ?? null);
+  const doc = await db
+    .collection<CampaignDoc>("campaigns")
+    .findOne({ _id: id });
+  return doc ? cleanCampaign(doc) : null;
+}
+export async function listCampaigns(): Promise<Campaign[]> {
+  const db = await database();
+  if (!db)
+    return [...store.campaigns.values()]
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 20)
+      .map((c) => structuredClone(c));
+  return (
+    await db
+      .collection<CampaignDoc>("campaigns")
+      .find({})
+      .sort({ createdAt: -1 })
+      .limit(20)
+      .toArray()
+  ).map(cleanCampaign);
+}
+export async function mutateCampaign(
+  id: string,
+  update: (campaign: Campaign) => Promise<Campaign>,
+): Promise<Campaign> {
+  const db = await database();
+  const lockKey = `campaign:${id}`;
+  if (!db) {
+    if (store.locks.has(lockKey))
+      throw new StoreError("Campaign advancement already in progress", 409);
+    const current = store.campaigns.get(id);
+    if (!current) throw new StoreError("Campaign not found", 404);
+    store.locks.add(lockKey);
+    try {
+      const next = await update(structuredClone(current));
+      store.campaigns.set(id, structuredClone(next));
+      return next;
+    } finally {
+      store.locks.delete(lockKey);
+    }
+  }
+  const collection = db.collection<CampaignDoc>("campaigns");
+  const token = randomUUID();
+  const acquired = await collection.findOneAndUpdate(
+    {
+      _id: id,
+      $or: [
+        { leaseUntil: { $exists: false } },
+        { leaseUntil: { $lt: new Date() } },
+      ],
+    },
+    { $set: { leaseToken: token, leaseUntil: new Date(Date.now() + 30000) } },
+    { returnDocument: "after" },
+  );
+  if (!acquired)
+    throw new StoreError("Campaign missing or already advancing", 409);
+  try {
+    const next = await update(cleanCampaign(acquired));
+    const result = await collection.replaceOne(
+      { _id: id, leaseToken: token, leaseUntil: { $gt: new Date() } },
+      { ...next, leaseToken: token, leaseUntil: acquired.leaseUntil },
+    );
+    if (!result.matchedCount)
+      throw new StoreError(
+        "Campaign lease expired; resume from its saved checkpoint",
+        409,
+      );
+    return next;
+  } finally {
+    await collection.updateOne(
+      { _id: id, leaseToken: token },
+      { $unset: { leaseToken: "", leaseUntil: "" } },
+    );
+  }
+}
+export async function closeDatabaseConnection(): Promise<void> {
+  if (store.client) await (await store.client).close();
+  store.client = undefined;
+  store.initialized = undefined;
 }

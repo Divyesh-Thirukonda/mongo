@@ -1,4 +1,14 @@
 import { AGENT_DEFINITIONS, createNetwork, getScenario } from "./scenarios";
+import type { IncidentVariant, MemoryRecall } from "./harness-types";
+import {
+  anticipateKnownPaths,
+  ensureHarness,
+  progressThreatCollaboration,
+  recordAgentReasoning,
+  recordContainmentExecution,
+  recordGuardrailRejection,
+  validateRoleRecommendation,
+} from "./war-room-harness";
 import type {
   AgentId,
   DefensePolicy,
@@ -10,6 +20,57 @@ import type {
 } from "./types";
 
 const MAX_TICKS = 42;
+
+export function incidentVariant(
+  scenarioId: ScenarioId,
+  variant: IncidentVariant = "original",
+) {
+  const scenario = getScenario(scenarioId);
+  const originalSecondary =
+    scenarioId === "exfiltration" ? "web-server" : "workstation-02";
+  if (variant === "lateral-shift")
+    return {
+      entryNodeId:
+        scenarioId === "ransomware"
+          ? "workstation-02"
+          : scenarioId === "supply-chain"
+            ? "web-server"
+            : "workstation-01",
+      secondaryNodeId:
+        scenarioId === "ransomware"
+          ? "build-server"
+          : scenarioId === "supply-chain"
+            ? "file-server"
+            : "web-server",
+      waveTicks: [2, 9, 16],
+      spreadInterval: Math.max(2, scenario.spreadInterval - 1),
+      damagePerTick: scenario.damagePerTick,
+      detectionAge: 1,
+    };
+  if (variant === "low-and-slow")
+    return {
+      entryNodeId:
+        scenarioId === "ransomware"
+          ? "file-server"
+          : scenarioId === "supply-chain"
+            ? "workstation-02"
+            : "web-server",
+      secondaryNodeId:
+        scenarioId === "exfiltration" ? "identity" : scenario.entryNodeId,
+      waveTicks: [3, 13, 23],
+      spreadInterval: scenario.spreadInterval + 2,
+      damagePerTick: Math.max(2, scenario.damagePerTick - 2),
+      detectionAge: 3,
+    };
+  return {
+    entryNodeId: scenario.entryNodeId,
+    secondaryNodeId: originalSecondary,
+    waveTicks: [1, 8, 15],
+    spreadInterval: scenario.spreadInterval,
+    damagePerTick: scenario.damagePerTick,
+    detectionAge: 1,
+  };
+}
 
 export function baselinePolicy(scenarioId: ScenarioId): DefensePolicy {
   return {
@@ -40,31 +101,71 @@ export function derivePolicy(
     current.isolationDelay - (current.version === 1 ? 3 : 1),
   );
   const candidate = { ...current, isolationDelay, scanCadence: 1 };
-  const baselineReplay = evaluatePolicy(run.scenarioId, run.seed, current);
-  const candidateReplay = evaluatePolicy(run.scenarioId, run.seed, candidate);
-  const accepted = candidateReplay.score > baselineReplay.score;
+  const seeds = [
+    run.seed,
+    (run.seed + 7919) % 2147483647,
+    (run.seed + 104729) % 2147483647,
+  ];
+  const comparisons = seeds.map((seed) => ({
+    baseline: evaluatePolicy(run.scenarioId, seed, current, run.variant),
+    candidate: evaluatePolicy(run.scenarioId, seed, candidate, run.variant),
+  }));
+  const average = (
+    side: "baseline" | "candidate",
+    field: "score" | "integrity",
+  ) =>
+    Math.round(
+      (comparisons.reduce((total, pair) => total + pair[side][field], 0) /
+        comparisons.length) *
+        100,
+    ) / 100;
+  const baselineReplay = {
+    score: average("baseline", "score"),
+    integrity: average("baseline", "integrity"),
+  };
+  const candidateReplay = {
+    score: average("candidate", "score"),
+    integrity: average("candidate", "integrity"),
+  };
+  const noRegression = comparisons.every(
+    (pair) => pair.candidate.score >= pair.baseline.score,
+  );
+  const accepted = candidateReplay.score > baselineReplay.score && noRegression;
   const selected = accepted ? candidate : current;
   return {
     scenarioId: run.scenarioId,
-    version: current.version + 1,
+    version: current.version + (accepted ? 1 : 0),
     isolationDelay: selected.isolationDelay,
     scanCadence: selected.scanCadence,
     learnedFrom: [...current.learnedFrom, run.id].slice(-50),
     updatedAt: run.updatedAt,
     lesson: accepted
-      ? `${infected} assets were reached. Counterfactual replay improved integrity ${baselineReplay.integrity}% → ${candidateReplay.integrity}%. Adopt ${selected.isolationDelay}-tick isolation and scan every tick.`
-      : `Counterfactual replay did not improve the current policy. Retain ${current.isolationDelay}-tick isolation; evidence from this exercise was recorded.`,
+      ? `${infected} assets were reached. Three-seed evaluation (${run.variant ?? "original"}, including two held-out seeds) improved mean integrity ${baselineReplay.integrity}% → ${candidateReplay.integrity}% without score regression. Adopt ${selected.isolationDelay}-tick isolation and scan every tick.`
+      : `Three-seed evaluation (${run.variant ?? "original"}, including two held-out seeds) did not safely improve the current policy. Retain v${current.version} and ${current.isolationDelay}-tick isolation; evidence recorded.`,
     evidence: {
       previousIntegrity: run.metrics.integrity,
       compromisedNodes: infected,
       ticks: run.tick,
       evaluation: {
         seed: run.seed,
-        baselineScore: baselineReplay.score,
-        candidateScore: candidateReplay.score,
+        baselineScore: comparisons[0].baseline.score,
+        candidateScore: comparisons[0].candidate.score,
         accepted,
-        baselineIntegrity: baselineReplay.integrity,
-        candidateIntegrity: candidateReplay.integrity,
+        baselineIntegrity: comparisons[0].baseline.integrity,
+        candidateIntegrity: comparisons[0].candidate.integrity,
+        validation: {
+          seeds,
+          cases: comparisons.map((pair, index) => ({
+            seed: seeds[index],
+            baselineScore: pair.baseline.score,
+            candidateScore: pair.candidate.score,
+            baselineIntegrity: pair.baseline.integrity,
+            candidateIntegrity: pair.candidate.integrity,
+          })),
+          meanBaselineScore: baselineReplay.score,
+          meanCandidateScore: candidateReplay.score,
+          noRegression,
+        },
       },
     },
   };
@@ -75,12 +176,14 @@ function evaluatePolicy(
   scenarioId: ScenarioId,
   seed: number,
   policy: DefensePolicy,
+  variant: IncidentVariant = "original",
 ): { score: number; integrity: number } {
   let evaluation = createInitialRun(scenarioId, seed, {
     id: "policy-evaluation",
     policy,
     aiEnabled: false,
     autoDefend: true,
+    variant,
   });
   for (
     let index = 0;
@@ -128,6 +231,10 @@ export function createInitialRun(
     autoDefend?: boolean;
     aiEnabled?: boolean;
     policy?: DefensePolicy;
+    variant?: IncidentVariant;
+    recall?: MemoryRecall;
+    memoryScope?: string;
+    campaign?: { id: string; episode: number };
   } = {},
 ): SimulationRun {
   const scenario = getScenario(scenarioId);
@@ -135,6 +242,9 @@ export function createInitialRun(
   const run: SimulationRun = {
     id: options.id ?? `preview-${scenarioId}-${seed}`,
     scenarioId,
+    variant: options.variant ?? "original",
+    memoryScope: options.memoryScope,
+    campaign: options.campaign,
     seed,
     status: "ready",
     tick: 0,
@@ -178,6 +288,7 @@ export function createInitialRun(
     message:
       "Synthetic cyber range. All attacks and defensive actions operate on simulated assets only.",
   });
+  ensureHarness(run, options.recall);
   snapshot(run);
   return run;
 }
@@ -265,6 +376,12 @@ function isolate(
       node.id,
       "defending",
     );
+  if (agentId === "bastion") recordContainmentExecution(run, node.id, source);
+  if (agentId === "commander")
+    for (const task of ensureHarness(run).tasks) {
+      if (task.nodeId === node.id && task.status !== "contained")
+        task.status = "contained";
+    }
 }
 
 function updateMetrics(run: SimulationRun): void {
@@ -298,10 +415,14 @@ function updateMetrics(run: SimulationRun): void {
         : 0;
   run.metrics.elapsedSeconds = run.tick * 2;
   const firstIsolation = run.nodes
-    .map((node) => node.isolatedAt)
+    .map((node) =>
+      node.isolatedAt !== undefined && node.compromisedAt !== undefined
+        ? Math.max(0, node.isolatedAt - node.compromisedAt)
+        : undefined,
+    )
     .filter((value): value is number => value !== undefined);
   if (firstIsolation.length)
-    run.metrics.responseTime = Math.max(0, Math.min(...firstIsolation) - 1) * 2;
+    run.metrics.responseTime = Math.min(...firstIsolation) * 2;
   for (const node of run.nodes.filter((entry) => entry.status === "exposed")) {
     if (
       !compromised.some((infected) => infected.connections.includes(node.id))
@@ -340,6 +461,8 @@ export function stepRun(previous: SimulationRun): SimulationRun {
     return structuredClone(previous);
   const run = structuredClone(previous);
   const scenario = getScenario(run.scenarioId);
+  const variant = incidentVariant(run.scenarioId, run.variant);
+  ensureHarness(run);
   run.status = "running";
   run.tick += 1;
   run.revision += 1;
@@ -352,21 +475,18 @@ export function stepRun(previous: SimulationRun): SimulationRun {
   }
 
   // Three staged entry attempts create a full incident arc. Quarantined paths stop reinfection.
-  if ([1, 8, 15].includes(run.tick)) {
+  if (variant.waveTicks.includes(run.tick)) {
     run.attack.wavesSpawned += 1;
-    const secondaryId =
-      run.scenarioId === "supply-chain"
-        ? "workstation-02"
-        : run.scenarioId === "exfiltration"
-          ? "web-server"
-          : "workstation-02";
     const entry = run.nodes.find(
       (node) =>
-        node.id === (run.tick === 1 ? scenario.entryNodeId : secondaryId),
+        node.id ===
+        (run.tick === variant.waveTicks[0]
+          ? variant.entryNodeId
+          : variant.secondaryNodeId),
     )!;
     if (
       entry.status === "isolated" ||
-      (run.tick === 15 && run.metrics.threatsBlocked >= 2)
+      (run.tick === variant.waveTicks[2] && run.metrics.threatsBlocked >= 2)
     ) {
       run.metrics.threatsBlocked += 1;
       addEvent(run, {
@@ -380,50 +500,33 @@ export function stepRun(previous: SimulationRun): SimulationRun {
       compromise(
         run,
         entry,
-        `${scenario.attackName}: ${run.tick === 1 ? "initial intrusion" : "secondary foothold"} on ${entry.label}.`,
+        `${scenario.attackName} [${run.variant ?? "original"}]: ${run.tick === variant.waveTicks[0] ? "initial intrusion" : "secondary foothold"} on ${entry.label}.`,
       );
     }
   }
+
+  anticipateKnownPaths(run);
 
   const infectedAtTickStart = run.nodes.filter(
     (node) => node.status === "compromised",
   );
   for (const [index, node] of infectedAtTickStart.entries()) {
     const age = run.tick - (node.compromisedAt ?? run.tick);
-    node.health = Math.max(0, node.health - scenario.damagePerTick);
+    node.health = Math.max(0, node.health - variant.damagePerTick);
     node.risk = Math.min(100, node.risk + 1);
-    if (age >= 1 && run.tick % run.policy.scanCadence === 0 && !node.detected) {
+    if (
+      age >= variant.detectionAge &&
+      run.tick % run.policy.scanCadence === 0 &&
+      !node.detected
+    ) {
       node.detected = true;
-      addEvent(run, {
-        agentId: "sentinel",
-        kind: "detection",
-        message: `Behavioral anomaly confirmed on ${node.label}. Correlating host and network signals.`,
-        nodeId: node.id,
-        confidence: 95,
-      });
-      directAgent(run, "sentinel", `Threat detected on ${node.label}`, node.id);
     }
-    if (age === 2) {
-      addEvent(run, {
-        agentId: "cipher",
-        kind: "analysis",
-        message: `${scenario.technique}. Signature matches ${scenario.attackName}; containment recommended.`,
-        nodeId: node.id,
-        confidence: 97,
-      });
-      directAgent(
-        run,
-        "cipher",
-        `Classified ${scenario.attackName} behavior`,
-        node.id,
-      );
-    }
-    // Adapted policies act before the next spread interval. This is an actual policy change, not a label.
-    if (run.autoDefend && node.detected && age >= run.policy.isolationDelay) {
+    // This gate consumes each specialist's evidence handoff and NEXUS's approval.
+    if (progressThreatCollaboration(run, node.id)) {
       isolate(run, node, "bastion");
       continue;
     }
-    if (age > 0 && age % scenario.spreadInterval === 0) {
+    if (age > 0 && age % variant.spreadInterval === 0) {
       const candidates = run.nodes.filter(
         (next) =>
           node.connections.includes(next.id) &&
@@ -520,7 +623,10 @@ export function stepRun(previous: SimulationRun): SimulationRun {
       message:
         "Exercise complete: containment objective missed. Incident evidence is ready for policy improvement.",
     });
-  } else if (run.tick >= 17 && run.metrics.compromised === 0) {
+  } else if (
+    run.tick >= variant.waveTicks[2] + 2 &&
+    run.metrics.compromised === 0
+  ) {
     run.status = "contained";
     run.metrics.containment = 100;
     addEvent(run, {
@@ -535,6 +641,12 @@ export function stepRun(previous: SimulationRun): SimulationRun {
       agent.status = "complete";
       agent.task = "Incident evidence archived for review";
     }
+  ensureHarness(run).phase =
+    run.status === "running"
+      ? run.metrics.compromised
+        ? "contain"
+        : "monitor"
+      : "review";
   snapshot(run);
   return run;
 }
@@ -566,7 +678,7 @@ export function applyAction(
       throw new Error("This asset is already isolated");
     isolate(run, node, "commander", "human");
   } else if (action.type === "scan") {
-    node.detected = true;
+    node.detected = node.status === "compromised";
     addEvent(run, {
       agentId: "sentinel",
       kind: "analysis",
@@ -581,6 +693,7 @@ export function applyAction(
       `Completed deep scan on ${node.label}`,
       node.id,
     );
+    progressThreatCollaboration(run, node.id);
   } else {
     if (node.status !== "isolated")
       throw new Error("Only isolated assets can be restored");
@@ -610,16 +723,15 @@ export function applyAgentRecommendation(
   confidence: number,
 ): void {
   const node = run.nodes.find((entry) => entry.id === nodeId);
-  addEvent(run, {
-    agentId,
-    kind: "decision",
-    message,
-    nodeId: node?.id,
-    confidence,
-    source: "openrouter",
-  });
-  directAgent(run, agentId, message, node?.id, "analyzing");
-  // Model actions are constrained to known, actually compromised synthetic assets.
+  const permission = validateRoleRecommendation(run, agentId, action, nodeId);
+  if (!permission.allowed) {
+    recordGuardrailRejection(run, agentId, permission.reason, node?.id);
+    return;
+  }
+  recordAgentReasoning(run, agentId, message, node?.id);
+  const reported = run.events.at(-1);
+  if (reported?.source === "openrouter") reported.confidence = confidence;
+  // The model cannot bypass a role's tool permissions or the evidence/approval gate.
   if (
     action === "isolate" &&
     run.autoDefend &&
@@ -627,7 +739,10 @@ export function applyAgentRecommendation(
     node.detected
   )
     isolate(run, node, agentId, "openrouter");
-  if (action === "scan" && node) node.detected = true;
+  if (action === "scan" && node) {
+    node.detected = node.status === "compromised";
+    progressThreatCollaboration(run, node.id);
+  }
   updateMetrics(run);
   snapshot(run);
 }

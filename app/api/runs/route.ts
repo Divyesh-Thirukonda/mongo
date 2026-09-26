@@ -1,7 +1,6 @@
-import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { getPolicy, insertRun, listRuns, storageStatus } from "@/lib/db";
-import { createInitialRun } from "@/lib/simulation";
+import { insertRun, listRuns, storageStatus } from "@/lib/db";
+import { prepareRun } from "@/lib/campaigns";
 import { apiError, body, json, rateLimit } from "../_shared";
 
 export const runtime = "nodejs";
@@ -16,6 +15,13 @@ const createSchema = z
     autoDefend: z.boolean().default(true),
     aiEnabled: z.boolean().default(false),
     useLearnedPolicy: z.boolean().default(true),
+    variant: z
+      .enum(["original", "lateral-shift", "low-and-slow"])
+      .default("original"),
+    memoryScope: z
+      .string()
+      .regex(/^[a-z0-9][a-z0-9-]{0,79}$/)
+      .default("shared"),
   })
   .strict();
 
@@ -23,17 +29,7 @@ export async function POST(request: Request): Promise<Response> {
   try {
     const input = await body(request, createSchema);
     await rateLimit(request, "create", 40, 3600);
-    const policy = input.useLearnedPolicy
-      ? await getPolicy(input.scenarioId)
-      : undefined;
-    const run = createInitialRun(input.scenarioId, input.seed, {
-      id: randomUUID(),
-      createdAt: new Date().toISOString(),
-      autoDefend: input.autoDefend,
-      aiEnabled: input.aiEnabled,
-      policy,
-    });
-    run.status = "running";
+    const run = await prepareRun(input);
     await insertRun(run);
     return json({ run, storage: storageStatus() }, 201);
   } catch (error) {
