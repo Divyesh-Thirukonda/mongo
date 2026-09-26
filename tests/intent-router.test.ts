@@ -134,3 +134,11 @@ test("an explicit human replacement can proceed after its conflicting source is 
   assert.ok(plan.constraints.every((constraint) => constraint.intentId === replacement.id));
   assert.deepEqual(replacement.decision!.parentIntentIds, [original.id], "Resolution preserves historical provenance.");
 });
+
+test('integration dependencies work beyond a particular provider',async()=>{
+ await withoutProvider(async()=>{
+  const first=intent('issues','Connect GitHub and load repository issues.');
+  const second=intent('sort','Sort the latest GitHub issues by date.',{revision:2});
+  const result=await classifyIntent(second,[first]);assert.equal(result.relation,'depend');assert.deepEqual(result.parentIntentIds,[first.id]);
+ });
+});
