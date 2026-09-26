@@ -1,6 +1,6 @@
 # AEGIS — the agent cyber range
 
-A 3D incident command room where five specialist defenders contain a synthetic cyber attack, preserve an evidence trail, and improve their next response through a counterfactual evaluation harness.
+A 3D security operations building where five specialist defenders contain a synthetic cyber attack, preserve an evidence trail, and improve their next response through a counterfactual evaluation harness. The architectural campus has three explorable floors, clickable rooms and agents, and a side panel for running and inspecting incidents.
 
 The network is a simulation. AEGIS does not scan real hosts, run exploits, or modify production infrastructure. The named agent roles are deterministic specialists by default. The optional live council uses a real OpenRouter model and can choose constrained actions on simulated assets.
 
@@ -26,8 +26,8 @@ Use the provisioned Atlas sandbox in the [project organization](https://cloud.mo
 
 ## The demo
 
-1. Select **Ransomware outbreak (Operation Blackout)**, turn **Use learned defense policy** off, and launch an exercise. Five specialists detect, classify, trace, contain, and coordinate the intrusion.
-2. Click an asset to inspect it, scan it, or isolate it. Isolation protects neighboring assets but lowers availability. Disable autonomous defense to see the cost of delayed intervention.
+1. Orbit and zoom around the building. Toggle **Exploded floors** and **Cutaway**, switch to the top-down camera, or select a level in the campus plan. The bottom toolbar reveals network links, agents, and threat paths.
+2. Select **Ransomware outbreak (Operation Blackout)**, turn **Use learned policy** off, and launch an exercise. Five specialists detect, classify, trace, contain, and coordinate the intrusion. Click a room or agent to inspect it. Scan or isolate assets from the inspector; isolation protects neighbors but lowers availability. Select **Manual** defense to see the cost of delayed intervention.
 3. Let the incident finish. Scrub the timeline to inspect previous network states and open the incident archive to revisit the run.
 4. Open **Agent memory**. The harness replays the incident seed with the current policy and a proposed policy, scores integrity and uptime, and promotes the candidate only if it improves the result.
 5. Launch the same scenario with learned policy enabled. Compare the response time, integrity, and number of affected assets. Toggle **AI reasoning** for live model analysis and bounded defensive decisions.
@@ -59,6 +59,7 @@ Seeded graph simulation + five defender roles
 ```
 
 - `lib/simulation.ts` contains pure, seeded transition functions. Three attack scenarios propagate across a twelve-asset graph, with deterministic detection, containment, damage, availability, and evidence generation. A tick represents two simulated seconds.
+- `components/war-room-scene.tsx` renders the campus with React Three Fiber, instanced server equipment, animated floor transitions, moving agents, and network packets. `lib/building-layout.ts` maps the twelve network assets to physical rooms. `hooks/use-war-room.ts` serializes simulation commands and protects the client against stale responses. Replay shows historical room states and communications; agent positions are shown only in the current view.
 - `lib/agents.ts` calls OpenRouter from the server. JSON Schema plus Zod validate one to three decisions. The model may scan known assets or isolate detected compromised assets when autonomous defense is enabled. All other behavior stays inside the simulation.
 - `lib/db.ts` stores full runs and replay snapshots, evidence, learned policies, and rate-limit counters in MongoDB. Cached connection pooling supports serverless reuse. Per-run leases and expected-tick checks prevent concurrent steps from advancing the same state twice.
 - Policy improvement compares two bounded rollouts of the same scenario and seed. The score is `0.65 × integrity + 0.35 × uptime − 0.1 × exfiltratedMB − 30 if breached`. Each accepted revision stores its source incident, tested scores, and integrity measurements.
