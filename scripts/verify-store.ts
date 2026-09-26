@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { acquireLease, applyRouting, closeDatabase, completeRevision, controlSession, createSession, database, getIntents, getSession, recordTokenUsage, releaseLease, snapshot, submitIntent } from '../lib/store';
+import { acquireLease, applyRouting, closeDatabase, completeRevision, controlSession, createSession, database, getIntents, getSession, recordTokenUsage, releaseLease, snapshot, submitIntent, updateSession } from '../lib/store';
 import { captureWorkspace, commitSourceCheckpoint, restoreSourceCheckpoint } from '../lib/source-checkpoint';
 import { createCheckpoint } from '../lib/context';
 import type { RoutingDecision } from '../lib/types';
@@ -14,15 +14,15 @@ try {
   assert.equal(await acquireLease(session.id,owner),true);
   const requestId=randomUUID();
   const [a,replay,b]=await Promise.all([
-    submitIntent(session.id,'alex','Connect Stripe',requestId),
-    submitIntent(session.id,'alex','Connect Stripe',requestId),
-    submitIntent(session.id,'sam','Add NEW badges to 3 latest Stripe products',randomUUID()),
+    submitIntent(session.id,'alex','Load project items',requestId),
+    submitIntent(session.id,'alex','Load project items',requestId),
+    submitIntent(session.id,'sam','Label the 3 latest project items',randomUUID()),
   ]);
   assert.equal(a.id,replay.id);assert.equal((await getSession(session.id)).revision,2);
   assert.equal((await getIntents(session.id)).length,2);
   assert.equal(await acquireLease(session.id,owner),true);
   assert.equal(await acquireLease(session.id,'another-worker'),false);
-  const decision:RoutingDecision={relation:'start',summary:'Connect Stripe',reason:'Verification',parentIntentIds:[],acceptance:['Connect Stripe'],source:'rules'};
+  const decision:RoutingDecision={relation:'start',summary:'Load project items',reason:'Verification',parentIntentIds:[],acceptance:['Load project items'],source:'rules'};
   await assert.rejects(()=>applyRouting(session.id,a.id,decision,'another-worker'));
   assert.equal(await completeRevision(session.id,2,{status:'complete'},owner),false);
   assert.equal((await getSession(session.id)).processedRevision,0);
@@ -45,9 +45,16 @@ try {
   assert.equal((await getSession(session.id)).status,'paused');assert.ok((await getIntents(session.id)).every(i=>i.status==='accepted'));
   await controlSession(session.id,'resume');assert.equal(await completeRevision(session.id,2,{status:'complete'},owner),true);
   assert.ok((await getIntents(session.id)).every(i=>i.status==='fulfilled'));
+  await submitIntent(session.id,'sam','Show the item count',randomUUID());
+  assert.equal(await completeRevision(session.id,2,{status:'paused',pauseRequested:true},owner),false);
+  const newer=await getSession(session.id);
+  assert.equal(newer.status,'planning');assert.equal(newer.pauseRequested,false);
+  assert.equal(newer.processedRevision,2);
+  await assert.rejects(()=>updateSession(session.id,{status:'paused',pauseRequested:true},owner,2));
+  assert.equal((await getSession(session.id)).pauseRequested,false);
   await releaseLease(session.id,owner);
   await assert.rejects(()=>commitSourceCheckpoint(session.id,owner,checkpoint,files));
-  console.log('PASS: Atlas concurrent idempotency, revision fence, single worker lease, atomic source checkpoint, deletion-preserving restore, token replay, pause boundary, and attributed fulfillment.');
+  console.log('PASS: Atlas concurrent idempotency, revision fence, single worker lease, atomic source checkpoint, deletion-preserving restore, token replay, pause boundary, attributed fulfillment, and stale review completion fencing.');
 } finally {
   const db=await database();
   for(const name of ['cv_intents','cv_events','cv_checkpoints','cv_source_checkpoints','cv_trajectory','cv_presence'])await db.collection(name).deleteMany({sessionId:session.id});

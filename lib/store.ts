@@ -109,10 +109,10 @@ export async function resolveIntent(sessionId:string,intentId:string,choice:"kee
     await eventInTx(db,tx,sessionId,{kind:"routing",actor:"Team",title:choice==="keep-existing"?"Existing direction retained":"New direction accepted",detail:"The team resolved the conflicting requirement. Its original author and text remain in the intent ledger.",intentIds:[intentId]});
   });
 }
-export async function updateSession(id:string,patch:Partial<Session>,owner?:string) {
+export async function updateSession(id:string,patch:Partial<Session>,owner?:string,expectedRevision?:number) {
   const set=Object.fromEntries(Object.entries(patch).filter(([,v])=>v!==undefined));
   const unset=Object.fromEntries(Object.entries(patch).filter(([,v])=>v===undefined).map(([k])=>[k,"" as const]));
-  const result=await sessions(await database()).updateOne({_id:id,...(owner?{leaseOwner:owner,leaseUntil:{$gt:now()}}:{})},{$set:{...set,updatedAt:now()},...(Object.keys(unset).length?{$unset:unset}:{})});
+  const result=await sessions(await database()).updateOne({_id:id,...(owner?{leaseOwner:owner,leaseUntil:{$gt:now()}}:{}),...(expectedRevision===undefined?{}:{revision:expectedRevision,historyRequest:{$exists:false}})},{$set:{...set,updatedAt:now()},...(Object.keys(unset).length?{$unset:unset}:{})});
   if(!result.matchedCount)throw new StoreError("Session or worker lease changed",409);
 }
 export async function incrementMetrics(id:string,values:Partial<Session["metrics"]>,owner:string) {
@@ -142,11 +142,11 @@ export async function completeRevision(id:string,revision:number,patch:Partial<S
     const blocked=await db.collection<IntentDoc>("cv_intents").countDocuments({sessionId:id,status:"blocked"},{session:tx});
     const queued=await db.collection<IntentDoc>("cv_intents").countDocuments({sessionId:id,status:"queued"},{session:tx});
     const stale=current.revision!==revision||queued>0;
-    await sessions(db).updateOne({_id:id},{$set:{...patch,processedRevision:stale||current.pauseRequested||blocked?current.processedRevision:revision,status:current.pauseRequested?"paused":stale?"planning":blocked?"blocked":patch.status??"complete",updatedAt:now()},$unset:{activeTurnId:""}},{session:tx});
+    await sessions(db).updateOne({_id:id},{$set:{...patch,...((stale||blocked)&&patch.pauseRequested?{pauseRequested:current.pauseRequested??false}:{}),processedRevision:stale||current.pauseRequested||blocked?current.processedRevision:revision,status:current.pauseRequested?"paused":stale?"planning":blocked?"blocked":patch.status??"complete",updatedAt:now()},$unset:{activeTurnId:""}},{session:tx});
     if(patch.status==="complete"&&!stale&&!blocked&&!current.pauseRequested)await db.collection<IntentDoc>("cv_intents").updateMany({sessionId:id,revision:{$lte:revision},status:"accepted"},{$set:{status:"fulfilled"}},{session:tx});
     const intents=(await db.collection<IntentDoc>("cv_intents").find({sessionId:id},{session:tx}).sort({revision:1}).toArray()).map(cleanIntent);
     await sessions(db).updateOne({_id:id},{$set:{plan:buildPlan(intents,current.revision)}},{session:tx});
-    return !stale&&!current.pauseRequested;
+    return !stale&&!current.pauseRequested&&!blocked;
   });
 }
 export async function controlSession(id:string,action:"pause"|"resume"|"retry") {
