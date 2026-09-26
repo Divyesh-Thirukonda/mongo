@@ -30,3 +30,15 @@ test('scheme, port, cross-site, opaque and malformed origins are rejected',()=>{
 test("same-origin browser GET has no Origin header and remains readable",()=>{
   assert.doesNotThrow(()=>validateWriteOrigin(new Request("http://localhost:3000/api/sessions",{headers:{host:"127.0.0.1:3000","sec-fetch-site":"same-origin"}})));
 });
+
+test('only configured public origins may access the internet deployment',()=>{
+ const previous=process.env.CONVERGE_PUBLIC_URL;
+ process.env.CONVERGE_PUBLIC_URL='https://converge-codex.vercel.app';
+ try{
+  validateWriteOrigin(request('https://converge-codex.vercel.app/api/sessions',{host:'converge-codex.vercel.app',origin:'https://converge-codex.vercel.app','sec-fetch-site':'same-origin'}));
+  validateWriteOrigin(request('http://localhost:3000/api/sessions',{host:'converge-codex.vercel.app',origin:'https://converge-codex.vercel.app','sec-fetch-site':'same-origin'}));
+  rejected(request('https://converge-codex.vercel.app/api/sessions',{host:'evil.example',origin:'https://evil.example'}));
+  rejected(request('https://converge-codex.vercel.app/api/sessions',{host:'converge-codex.vercel.app',origin:'https://other.vercel.app'}));
+  rejected(request('https://evil.example/api/sessions',{host:'evil.example',origin:'https://evil.example'}));
+ }finally{if(previous===undefined)delete process.env.CONVERGE_PUBLIC_URL;else process.env.CONVERGE_PUBLIC_URL=previous;}
+});

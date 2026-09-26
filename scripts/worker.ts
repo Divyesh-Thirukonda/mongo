@@ -18,7 +18,7 @@ const instructions=`You are the coding engine for CONVERGE, a collaborative inte
 async function routeQueued(id:string){
   let intents=await getIntents(id);
   for(const intent of intents.filter(i=>i.status==='queued')){
-    if(!(await claimModelBudget()))throw new Error('Hourly model budget reached. Your intent is saved; resume when the budget resets.');
+    if(!(await claimModelBudget(id)))throw new Error('An hourly workspace, owner, or shared execution limit was reached. Your intent is saved; resume after the next hour.');
     const decision=await classifyIntent(intent,intents.filter(i=>i.revision<intent.revision));
     await applyRouting(id,intent.id,decision,owner);
     intents=await getIntents(id);
@@ -108,7 +108,7 @@ async function runSession(initial:Session){
       if(current.pauseRequested){await updateSession(id,{status:'paused',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
       if(intents.some(i=>i.status==='blocked')){await updateSession(id,{status:'blocked',activeTurnId:undefined},owner);await checkpoint(id,root);return;}
       const state=routed;const context=buildContext(state.session,state.intents,state.checkpoints,state.events);
-      if(!(await claimModelBudget()))throw new Error('Hourly model budget reached. The coding checkpoint is saved.');
+      if(!(await claimModelBudget(id)))throw new Error('An hourly workspace, owner, or shared execution limit was reached. The coding checkpoint is saved; resume after the next hour.');
       let sentRevision=current.revision;turnTools=0;
       const started=await bridge.startTurn({threadId,text:`${instructions}\n\nShared intent revision ${sentRevision}:\n${context.text}\n\n${feedback}\nImplement the accepted changes now, and verify your code.`,clientUserMessageId:`${id}-r${sentRevision}-repair${repair}`});
       await updateSession(id,{activeTurnId:started.turn.id,status:'running'},owner);

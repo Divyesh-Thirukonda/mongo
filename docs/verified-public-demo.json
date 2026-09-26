@@ -1,0 +1,82 @@
+{
+  "verifiedAt": "2026-09-26T19:02:21.244Z",
+  "application": "https://converge-codex.vercel.app",
+  "atlasProjectId": "6ab7dfb87130c8fd8fdf8c9a",
+  "sessionId": "be19f35f-95fb-4205-840e-e3bdf406f73c",
+  "status": "complete",
+  "revision": 2,
+  "codexThreadId": "01a0df16-2e51-70f2-adea-a14f169c0301",
+  "metrics": {
+    "turns": 2,
+    "toolCalls": 10,
+    "mergedIntents": 1,
+    "avoidedRuns": 1,
+    "checksPassed": 4,
+    "checksTotal": 4,
+    "contextChars": 13020,
+    "archivedEvents": 37,
+    "providerTokens": 254552,
+    "steers": 1
+  },
+  "intents": [
+    {
+      "authorId": "7c2455ae-192c-49ff-a487-a2c5386e1856",
+      "text": "Connect Stripe and display the product catalog",
+      "status": "fulfilled",
+      "relation": "start"
+    },
+    {
+      "authorId": "705c5858-eaee-4f7f-9467-bc25dc027772",
+      "text": "Add NEW to the 3 most recently added Stripe products",
+      "status": "fulfilled",
+      "relation": "depend"
+    }
+  ],
+  "checks": [
+    {
+      "name": "Stripe adapter returns the complete active catalog",
+      "passed": true,
+      "detail": "Two pages, including an inactive product, are verified independently.",
+      "intentIds": [
+        "405be9b1-5f54-4c55-8dab-e82084dcf96e"
+      ]
+    },
+    {
+      "name": "Pagination follows the last product cursor",
+      "passed": true,
+      "detail": "The second request must use the last product ID from the first page.",
+      "intentIds": [
+        "405be9b1-5f54-4c55-8dab-e82084dcf96e"
+      ]
+    },
+    {
+      "name": "Names and prices are preserved",
+      "passed": true,
+      "detail": "The verifier checks source values in its own process.",
+      "intentIds": [
+        "405be9b1-5f54-4c55-8dab-e82084dcf96e"
+      ]
+    },
+    {
+      "name": "Only the 3 newest products receive NEW",
+      "passed": true,
+      "detail": "Input order is shuffled and inactive products cannot receive the badge.",
+      "intentIds": [
+        "777f557f-4deb-4ec9-847e-94a6777fe3ec"
+      ]
+    }
+  ],
+  "sourceCheckpointId": "checkpoint-8b6d088405310929e74c",
+  "proof": {
+    "twoNativeCookiePartitions": true,
+    "publicGuestInvitations": true,
+    "publicMcpContextAndProgress": true,
+    "codexCompatibleStdioTransport": true,
+    "installedCodexCliConfiguration": true
+  },
+  "limitations": [
+    "Coding worker runs on the host Mac.",
+    "Stripe-compatible fixture; no live Stripe payments.",
+    "Connected Codex progress is self-reported and distinguished from managed-worker verification."
+  ]
+}

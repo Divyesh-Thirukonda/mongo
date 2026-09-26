@@ -1,8 +1,9 @@
 import "server-only";
 import { MongoClient, type ClientSession, type Db } from "mongodb";
 import { randomUUID, createHash } from "node:crypto";
-import type { Intent, PersonId, Session, SessionSnapshot, TrajectoryEvent, MemoryCheckpoint, Presence, RoutingDecision } from "./types";
+import type { Intent, PersonId, Session, SessionSnapshot, TrajectoryEvent, MemoryCheckpoint, Presence, RoutingDecision, Identity } from "./types";
 import { buildPlan } from "./intent-router";
+import { modelBudgetScopes, reserveModelBudgetScopes } from "./model-budget";
 
 type SessionDoc = Session & { _id: string; eventSequence: number };
 type IntentDoc = Intent & { _id: string; requestId: string };
@@ -13,8 +14,8 @@ const pool = globalThis as typeof globalThis & { convergeClient?: Promise<MongoC
 export class StoreError extends Error { constructor(message: string, public status = 503) { super(message); } }
 export function redact(value: string): string {
   let clean = value;
-  for (const secret of [process.env.MONGODB_URI, process.env.OPENROUTER_API_KEY, process.env.VERCEL_OIDC_TOKEN]) if (secret) clean = clean.split(secret).join("[redacted]");
-  return clean.replace(/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi,"[redacted database URI]").replace(/\bsk-(?:or-v1-)?[a-z0-9_-]{12,}/gi,"[redacted key]").replace(/Bearer\s+[^\s"']+/gi,"Bearer [redacted]");
+  for (const secret of [process.env.MONGODB_URI, process.env.OPENROUTER_API_KEY, process.env.VERCEL_OIDC_TOKEN, process.env.BETTER_AUTH_SECRET]) if (secret) clean = clean.split(secret).join("[redacted]");
+  return clean.replace(/\bcvg_[A-Za-z0-9_-]{43}\b/g,"[redacted agent token]").replace(/([?&]join=)[A-Za-z0-9_-]{43}/g,"$1[redacted invitation]").replace(/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi,"[redacted database URI]").replace(/\bsk-(?:or-v1-)?[a-z0-9_-]{12,}/gi,"[redacted key]").replace(/Bearer\s+[^\s"']+/gi,"Bearer [redacted]");
 }
 export async function database(): Promise<Db> {
   if (!process.env.MONGODB_URI) throw new StoreError("Connect the provisioned Atlas sandbox by setting MONGODB_URI in .env.local.");
@@ -28,9 +29,15 @@ export async function database(): Promise<Db> {
     db.collection("cv_trajectory").createIndex({sessionId:1,turnId:1,createdAt:1}),
     db.collection("cv_presence").createIndex({expiresAt:1},{expireAfterSeconds:0}),
     db.collection("cv_workers").createIndex({seenAt:1},{expireAfterSeconds:120}),
+    db.collection("cv_memberships").createIndex({userId:1,sessionId:1},{unique:true}),
+    db.collection("cv_participants").createIndex({sessionId:1,userId:1},{unique:true}),
+    db.collection("cv_invites").createIndex({expiresAt:1},{expireAfterSeconds:0}),
+    db.collection("cv_api_limits").createIndex({expiresAt:1},{expireAfterSeconds:0}),
+    db.collection("cv_budgets").createIndex({expiresAt:1},{expireAfterSeconds:0}),
   ]).then(()=>undefined).catch(()=>{pool.convergeInitialized=undefined;throw new StoreError("Atlas collection initialization failed.");});
   await pool.convergeInitialized; return db;
 }
+export async function databaseClient():Promise<MongoClient>{await database();return await pool.convergeClient!;}
 export async function transaction<T>(fn: (db:Db, tx:ClientSession)=>Promise<T>):Promise<T> {
   const db=await database(); const client=await pool.convergeClient!;
   return client.withSession(tx=>tx.withTransaction(()=>fn(db,tx),{readConcern:{level:"snapshot"},writeConcern:{w:"majority"}}));
@@ -46,12 +53,19 @@ async function eventInTx(db:Db, tx:ClientSession, sessionId:string, input:Omit<T
   await db.collection<EventDoc>("cv_events").insertOne({_id:id,id,sessionId,sequence:doc.eventSequence,createdAt:now(),...input,title:redact(input.title).slice(0,300),detail:redact(input.detail).slice(0,8000)},{session:tx});
 }
 export async function appendEvent(sessionId:string,input:Omit<TrajectoryEvent,"id"|"sessionId"|"sequence"|"createdAt">) { await transaction((db,tx)=>eventInTx(db,tx,sessionId,input)); }
-export async function createSession(name="Stripe storefront"):Promise<Session> {
-  const db=await database();const at=now();const id=randomUUID();
-  const session:Session={id,name:name.trim().slice(0,80)||"Untitled workspace",goal:"Build a shared storefront, one intent at a time.",createdAt:at,updatedAt:at,revision:0,processedRevision:0,status:"idle",plan:{summary:"Waiting for the first intent",steps:[],constraints:[],revision:0},metrics:{turns:0,toolCalls:0,mergedIntents:0,avoidedRuns:0,checksPassed:0,checksTotal:0,contextChars:0,archivedEvents:0,providerTokens:0,steers:0}};
-  await sessions(db).insertOne({...session,_id:id,eventSequence:0});return session;
+export async function createSession(name="Stripe storefront",owner?:Identity):Promise<Session> {
+  const at=now();const id=randomUUID();
+  const session:Session={id,...(owner?{ownerId:owner.id}:{}),name:name.trim().slice(0,80)||"Untitled workspace",goal:"Build a shared storefront, one intent at a time.",createdAt:at,updatedAt:at,revision:0,processedRevision:0,status:"idle",plan:{summary:"Waiting for the first intent",steps:[],constraints:[],revision:0},metrics:{turns:0,toolCalls:0,mergedIntents:0,avoidedRuns:0,checksPassed:0,checksTotal:0,contextChars:0,archivedEvents:0,providerTokens:0,steers:0}};
+  await transaction(async(db,tx)=>{
+    if(owner){const count=await sessions(db).countDocuments({ownerId:owner.id},{session:tx});if(count>=(owner.isAnonymous?3:30))throw new StoreError("Workspace limit reached for this account.",429);}
+    await sessions(db).insertOne({...session,_id:id,eventSequence:0},{session:tx});
+    if(owner){
+      await db.collection<{_id:string;sessionId:string;userId:string;role:string;createdAt:string}>("cv_memberships").insertOne({_id:`${id}:${owner.id}`,sessionId:id,userId:owner.id,role:"owner",createdAt:at},{session:tx});
+      await db.collection<{_id:string;sessionId:string;userId:string;name:string;isAnonymous:boolean}>("cv_participants").insertOne({_id:`${id}:${owner.id}`,sessionId:id,userId:owner.id,name:owner.name,isAnonymous:owner.isAnonymous},{session:tx});
+    }
+  });return session;
 }
-export async function listSessions():Promise<Session[]> { return (await sessions(await database()).find({}).sort({updatedAt:-1}).limit(40).toArray()).map(cleanSession); }
+export async function listSessions(userId?:string):Promise<Session[]> {if(!userId)return [];const db=await database();const memberships=await db.collection<{sessionId:string}>("cv_memberships").find({userId}).limit(100).toArray();return(await sessions(db).find({_id:{$in:memberships.map(row=>row.sessionId)}}).sort({updatedAt:-1}).limit(40).toArray()).map(cleanSession);}
 export async function getSession(id:string):Promise<Session> { const doc=await sessions(await database()).findOne({_id:id});if(!doc)throw new StoreError("Session not found",404);return cleanSession(doc); }
 export async function getIntents(id:string):Promise<Intent[]> { return (await (await database()).collection<IntentDoc>("cv_intents").find({sessionId:id}).sort({revision:1}).toArray()).map(cleanIntent); }
 export async function submitIntent(sessionId:string,authorId:PersonId,text:string,requestId:string):Promise<Intent> {
@@ -147,7 +161,7 @@ export async function snapshot(id:string):Promise<SessionSnapshot>{
   const checkpoints=await db.collection<CheckpointDoc>("cv_checkpoints").find({sessionId:id},{session:tx}).sort({createdAt:-1}).limit(8).toArray();
   const people=await db.collection<Presence>("cv_presence").find({sessionId:id,seenAt:{$gt:new Date(Date.now()-45000).toISOString()}},{session:tx}).toArray();
   const worker=await db.collection<WorkerDoc>("cv_workers").find({seenAt:{$gt:new Date(Date.now()-20000)}},{session:tx}).sort({seenAt:-1}).limit(1).next();
-  return {session,intents,events:events.reverse().map(({_id,...e})=>{void _id;return e;}),checkpoints:checkpoints.map(({_id,...c})=>{void _id;return c;}),presence:people.map(p=>({sessionId:p.sessionId,personId:p.personId,seenAt:p.seenAt})),worker:{online:Boolean(worker),engine:worker?.engine??"Codex App Server",lastSeenAt:worker?.seenAt.toISOString()},storage:{mode:"atlas",connected:true}};
+  return {session,intents,participants:[],currentUserId:"",events:events.reverse().map(({_id,...e})=>{void _id;return e;}),checkpoints:checkpoints.map(({_id,...c})=>{void _id;return c;}),presence:people.map(p=>({sessionId:p.sessionId,personId:p.personId,seenAt:p.seenAt})),worker:{online:Boolean(worker),engine:worker?.engine??"Codex App Server",lastSeenAt:worker?.seenAt.toISOString()},storage:{mode:"atlas",connected:true}};
   });
 }
 export async function recordTrajectory(sessionId:string,turnId:string|undefined,method:string,payload:unknown){
@@ -155,8 +169,17 @@ export async function recordTrajectory(sessionId:string,turnId:string|undefined,
   const chunks=raw.match(/[\s\S]{1,200000}/g)??[""];
   await(await database()).collection<{_id:string;sessionId:string;turnId?:string;method:string;data:string;chunk:number;chunks:number;createdAt:Date}>("cv_trajectory").bulkWrite(chunks.map((data,index)=>({updateOne:{filter:{_id:`${digest}:${index}`},update:{$setOnInsert:{sessionId,turnId,method,data,chunk:index,chunks:chunks.length,createdAt:new Date()}},upsert:true}})));
 }
-export async function claimModelBudget(limit=100):Promise<boolean>{
-  const db=await database();const key=`model:${Math.floor(Date.now()/3600000)}`;
-  const result=await db.collection<{_id:string;count:number}>("cv_budgets").findOneAndUpdate({_id:key},{$inc:{count:1}},{upsert:true,returnDocument:"after"});return Boolean(result&&result.count<=limit);
+export async function claimModelBudget(sessionId:string):Promise<boolean>{
+  for(let attempt=0;attempt<5;attempt++){
+    try{return await transaction(async(db,tx)=>{
+      const session=await sessions(db).findOne({_id:sessionId},{session:tx});if(!session)throw new StoreError("Session not found",404);
+      const at=Date.now();return reserveModelBudgetScopes(db,tx,modelBudgetScopes(session,at),at);
+    });}catch(error){
+      // Simultaneous first claims can collide on an absent counter's unique ID.
+      // The failed transaction consumed nothing; retry against the winning row.
+      if(attempt===4||!error||typeof error!=="object"||!("code"in error)||error.code!==11000)throw error;
+    }
+  }
+  return false;
 }
 export async function closeDatabase(){if(pool.convergeClient)await(await pool.convergeClient).close();pool.convergeClient=undefined;pool.convergeInitialized=undefined;}

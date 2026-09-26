@@ -1,5 +1,7 @@
 const { app, BrowserWindow, dialog, ipcMain, Menu, session } = require("electron");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
+const { randomUUID } = require("node:crypto");
+const { promisify } = require("node:util");
 const { existsSync, readFileSync } = require("node:fs");
 const path = require("node:path");
 
@@ -26,6 +28,7 @@ function configuration() {
   if (!existsSync(envFile)) throw new Error("The external environment file is missing. Set CONVERGE_ENV_FILE to your .env.local path, then reopen Converge. Credentials are intentionally outside this application.");
   return {
     port,
+    appUrl: inherited.CONVERGE_APP_URL ?? locator.appUrl,
     envFile,
     runtime: app.isPackaged ? path.join(process.resourcesPath, "runtime") : workspace,
     dataDir: path.resolve(inherited.CONVERGE_DATA_DIR ?? locator.dataDir ?? path.join(workspace, ".converge")),
@@ -67,6 +70,7 @@ async function healthy() {
 }
 
 async function startServices() {
+  if (settings.appUrl && !(await healthy())) throw new Error("The shared server is unavailable. Check your internet connection and reopen Converge.");
   if (!(await healthy())) {
     const args = app.isPackaged
       ? [path.join(settings.runtime, "server.js")]
@@ -98,20 +102,18 @@ function allowed(url) {
   catch { return false; }
 }
 
-function collaboratorUrl(url) {
-  const target = new URL(url);
-  target.searchParams.set("person", target.searchParams.get("person") === "sam" ? "alex" : "sam");
-  return target.href;
-}
-
-function createWindow(url = `${origin}/`) {
+function createWindow(url = `${origin}/`, isolated = false) {
   if (!allowed(url) || windows.size >= 2) return false;
+  const browserSession = isolated ? session.fromPartition(`converge-guest-${randomUUID()}`) : session.defaultSession;
+  browserSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
+  browserSession.setPermissionCheckHandler(() => false);
   const win = new BrowserWindow({
     width: 1480, height: 940, minWidth: 1060, minHeight: 680,
     title: "Converge", backgroundColor: "#f7f8f7", show: false,
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     trafficLightPosition: { x: 18, y: 18 },
     webPreferences: {
+      session: browserSession,
       preload: path.join(__dirname, "preload.cjs"),
       nodeIntegration: false, nodeIntegrationInWorker: false,
       contextIsolation: true, sandbox: true, webSecurity: true,
@@ -127,7 +129,7 @@ function createWindow(url = `${origin}/`) {
   win.webContents.on("did-fail-load", (_event, code, _description, _url, isMainFrame) => {
     if (isMainFrame && code !== -3 && !stopping) {
       win.show();
-      dialog.showErrorBox("Converge could not load", "The local application is unavailable. Your durable session is retained in Atlas.");
+      dialog.showErrorBox("Converge could not load", "The application is unavailable. Your session is retained in Atlas. Check your internet connection.");
     }
   });
   void win.loadURL(url).catch(() => {});
@@ -168,17 +170,33 @@ else {
   void app.whenReady().then(async () => {
     app.setName("Converge");
     settings = configuration();
-    origin = `http://127.0.0.1:${settings.port}`;
+    origin = settings.appUrl ? new URL(settings.appUrl).origin : `http://127.0.0.1:${settings.port}`;
+    if (settings.appUrl && new URL(origin).protocol !== "https:") throw new Error("The shared app must use HTTPS.");
     session.defaultSession.setPermissionRequestHandler((_webContents, _permission, callback) => callback(false));
     session.defaultSession.setPermissionCheckHandler(() => false);
-    ipcMain.handle("converge:open-collaborator", (event) => {
+    const trustedSender = (event) => {
       const sender = BrowserWindow.fromWebContents(event.sender);
-      if (!sender || !windows.has(sender) || event.senderFrame !== event.sender.mainFrame || !allowed(event.senderFrame.url)) return false;
+      return sender && windows.has(sender) && event.senderFrame === event.sender.mainFrame && allowed(event.senderFrame.url);
+    };
+    ipcMain.handle("converge:open-collaborator", (event, options) => {
+      const sender = BrowserWindow.fromWebContents(event.sender);
+      if (!trustedSender(event) || typeof options?.url !== "string" || !allowed(options.url)) return false;
       if (windows.size >= 2) { [...windows].find((win) => win !== sender)?.focus(); return false; }
-      return createWindow(collaboratorUrl(event.senderFrame.url));
+      return createWindow(options.url, true);
+    });
+    ipcMain.handle("converge:install-codex", async (event, options) => {
+      if (!trustedSender(event)) throw new Error("Untrusted application window.");
+      if (!/^[a-f0-9-]{36}$/i.test(options?.sessionId ?? "") || !/^cvg_[A-Za-z0-9_-]{43}$/.test(options?.token ?? "") || options?.serverUrl !== `${origin}/api/codex/mcp`) throw new Error("Invalid session connection.");
+      const binary = inherited.CONVERGE_CODEX_BINARY ?? "/Applications/ChatGPT.app/Contents/Resources/codex";
+      const npx = existsSync("/opt/homebrew/bin/npx") ? "/opt/homebrew/bin/npx" : "npx";
+      const name = `converge-${options.sessionId.slice(0, 8)}`;
+      try {
+        await promisify(execFile)(binary, ["mcp", "add", name, "--env", `CONVERGE_AUTH=Bearer ${options.token}`, "--", npx, "--yes", "mcp-remote@0.14.3", options.serverUrl, "--header", "Authorization:${CONVERGE_AUTH}", "--transport", "http-only"], { env: { ...osEnvironment, PATH: `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${osEnvironment.PATH ?? ""}` }, timeout: 15000, maxBuffer: 16384 });
+        return { installed: true, name };
+      } catch { throw new Error("Codex could not be configured. Use Copy command to connect from your terminal."); }
     });
     Menu.setApplicationMenu(Menu.buildFromTemplate([
-      { label: "Converge", submenu: [{ role: "about" }, { type: "separator" }, { label: "Open collaborator window", accelerator: "CmdOrCtrl+Shift+N", click: () => { const win = BrowserWindow.getFocusedWindow() ?? [...windows][0]; if (win) createWindow(collaboratorUrl(win.webContents.getURL())); } }, { type: "separator" }, { role: "quit" }] },
+      { label: "Converge", submenu: [{ role: "about" }, { type: "separator" }, { label: "Open guest window", accelerator: "CmdOrCtrl+Shift+N", click: () => createWindow(`${origin}/`, true) }, { type: "separator" }, { role: "quit" }] },
       { role: "editMenu" }, { role: "viewMenu" }, { role: "windowMenu" },
     ]));
     await startServices();

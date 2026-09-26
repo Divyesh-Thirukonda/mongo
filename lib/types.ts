@@ -1,4 +1,6 @@
-export type PersonId = "alex" | "sam" | "jordan";
+export type PersonId = string;
+export interface Identity { id: string; name: string; email?: string; isAnonymous: boolean }
+export interface Participant { id: string; name: string; initials: string; color: string; isAnonymous: boolean }
 export const PEOPLE = [
   { id: "alex" as const, name: "Alex Morgan", initials: "AM", color: "#6579c5", role: "Engineering" },
   { id: "sam" as const, name: "Sam Chen", initials: "SC", color: "#ad7854", role: "Product" },
@@ -56,6 +58,7 @@ export interface SessionMetrics {
 }
 export interface Session {
   id: string;
+  ownerId?: string;
   name: string;
   goal: string;
   createdAt: string;
@@ -85,6 +88,10 @@ export interface TrajectoryEvent {
   title: string;
   detail: string;
   intentIds: string[];
+  /** Connected reports are self-reported; omitted on legacy managed-worker events. */
+  source?: "managed-worker" | "connected-agent";
+  externalTrajectoryId?: string;
+  actorUserId?: string;
   turnId?: string;
 }
 export interface MemoryCheckpoint {
@@ -100,6 +107,8 @@ export interface SessionSnapshot {
   events: TrajectoryEvent[];
   checkpoints: MemoryCheckpoint[];
   presence: Presence[];
+  participants: Participant[];
+  currentUserId: string;
   worker: { online: boolean; engine: string; lastSeenAt?: string };
   storage: { mode: "atlas"; connected: boolean };
 }

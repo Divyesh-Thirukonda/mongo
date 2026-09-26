@@ -1,0 +1,25 @@
+{
+  "name": "converge",
+  "version": "0.2.0",
+  "description": "Use the shared Converge intent graph and durable team context from Codex.",
+  "author": {
+    "name": "Converge"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Converge",
+    "shortDescription": "Work from shared team intent in Codex.",
+    "longDescription": "Connect a Converge session to Codex through its scoped MCP server, preserve teammates\u2019 active requirements, and report real progress into the live graph.",
+    "developerName": "Converge",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Connect Codex to my Converge session.",
+      "Read the shared plan and continue work."
+    ]
+  },
+  "repository": "https://github.com/Divyesh-Thirukonda/mongo"
+}

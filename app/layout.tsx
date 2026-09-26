@@ -1,8 +1,8 @@
 import type { Metadata } from "next";
 import "./globals.css";
 export const metadata: Metadata = {
-  title: "Converge — One shared direction",
-  description: "A collaborative coding workspace. Bring different perspectives into one shared agent session.",
+  title: "Converge — Coding sessions",
+  description: "Shared coding sessions with attributed requests, live agent activity, and verified changes.",
   icons: { icon: "/favicon.svg" },
 };
 export default function RootLayout({
