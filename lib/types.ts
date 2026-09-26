@@ -41,13 +41,11 @@ export interface SharedPlan {
   revision: number;
 }
 export interface CheckResult { name: string; passed: boolean; detail: string; intentIds: string[] }
-export interface Product { id: string; name: string; price: number; created: number; badge?: string }
 export interface Artifact {
   files: Array<{ path: string; additions: number; deletions: number }>;
   diff: string;
   checks: CheckResult[];
-  products: Product[];
-  stripeConnected: boolean;
+  reviewRequired?: boolean;
   verifiedRevision: number;
   updatedAt: string;
 }
