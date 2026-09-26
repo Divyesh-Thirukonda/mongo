@@ -70,8 +70,16 @@ async function healthy() {
 }
 
 async function startServices() {
-  if (settings.appUrl && !(await healthy())) throw new Error("The shared server is unavailable. Check your internet connection and reopen Converge.");
-  if (!(await healthy())) {
+  if (settings.appUrl) {
+    // A freshly deployed shared API may need a cold start before Atlas is ready.
+    const deadline = Date.now() + 15000;
+    while (!(await healthy())) {
+      if (stopping) throw new Error("Application is closing.");
+      if (Date.now() >= deadline) throw new Error("The shared server is unavailable. Check your internet connection and reopen Converge.");
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+  }
+  if (!settings.appUrl && !(await healthy())) {
     const args = app.isPackaged
       ? [path.join(settings.runtime, "server.js")]
       : [path.join(settings.runtime, "node_modules/next/dist/bin/next"), "dev", "--hostname", "127.0.0.1", "--port", String(settings.port)];
