@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Menu, session } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, Menu, session, clipboard } = require("electron");
 const { spawn, execFile } = require("node:child_process");
 const { randomUUID } = require("node:crypto");
 const { promisify } = require("node:util");
@@ -186,6 +186,11 @@ else {
       const sender = BrowserWindow.fromWebContents(event.sender);
       return sender && windows.has(sender) && event.senderFrame === event.sender.mainFrame && allowed(event.senderFrame.url);
     };
+    ipcMain.handle("converge:copy-text", (event, text) => {
+      if (!trustedSender(event) || typeof text !== "string" || text.length > 32768) throw new Error("Invalid clipboard request.");
+      clipboard.writeText(text);
+      return true;
+    });
     ipcMain.handle("converge:open-collaborator", (event, options) => {
       const sender = BrowserWindow.fromWebContents(event.sender);
       if (!trustedSender(event) || typeof options?.url !== "string" || !allowed(options.url)) return false;

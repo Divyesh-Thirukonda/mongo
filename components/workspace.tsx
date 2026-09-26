@@ -9,7 +9,7 @@ import { WebsitePreview } from "@/components/website-preview";
 
 type InspectorTab = "preview" | "activity" | "plan" | "changes" | "memory";
 type Participant = { id: string; name: string; initials: string; color: string; isAnonymous: boolean };
-type DesktopWindow = Window & { convergeDesktop?: { isDesktop: boolean; openCollaboratorWindow: (options: { url: string }) => Promise<unknown>; installCodexConnection?: (options: { sessionId: string; serverUrl: string; token: string }) => Promise<{ installed: true; name: string }> } };
+type DesktopWindow = Window & { convergeDesktop?: { isDesktop: boolean; copyText?: (text: string) => Promise<boolean>; openCollaboratorWindow: (options: { url: string }) => Promise<unknown>; installCodexConnection?: (options: { sessionId: string; serverUrl: string; token: string }) => Promise<{ installed: true; name: string }> } };
 type ActivityItem = { type: "intent"; value: Intent } | { type: "event"; value: TrajectoryEvent };
 const RELATIONS = { start: "New request", extend: "Extends the plan", depend: "Depends on earlier work", duplicate: "Already covered", conflict: "Decision needed", parallel: "Parallel work" };
 const EMPTY_PARTICIPANTS: Participant[] = [];
@@ -23,6 +23,17 @@ async function api<T>(path: string, body?: unknown, signal?: AbortSignal): Promi
   if (!response.ok) throw new ApiError(data?.error ?? `Request failed (${response.status}). Please try again.`, response.status);
   if (data === null) throw new Error("The server returned an unreadable response. Please try again.");
   return data as T;
+}
+async function copyText(text: string) {
+  const nativeCopy = (window as DesktopWindow).convergeDesktop?.copyText;
+  if (nativeCopy) { await nativeCopy(text); return; }
+  try { await navigator.clipboard.writeText(text); return; } catch { /* Embedded browsers may deny the async clipboard API. */ }
+  const previous = document.activeElement;
+  const input = document.createElement("textarea");
+  input.value = text; input.style.cssText = "position:fixed;left:-9999px;top:0";
+  document.body.appendChild(input); input.select();
+  try { if (!document.execCommand("copy")) throw new Error("Clipboard unavailable"); }
+  finally { input.remove(); if (previous instanceof HTMLElement) previous.focus(); }
 }
 function person(id: string, participants: Participant[]) { return participants.find((entry) => entry.id === id) ?? { id, name: "Former participant", initials: "?", color: "#8a8d83", isAnonymous: false }; }
 function initials(name: string) { return name.trim().split(/\s+/).slice(0, 2).map((part) => Array.from(part)[0]).join("").toUpperCase() || "?"; }
@@ -217,7 +228,7 @@ export default function Workspace() {
     catch (cause) { setError(cause instanceof Error ? cause.message : "Could not create an invite link."); }
     finally { setShareBusy(false); }
   };
-  const copyLink = async () => { if (!shareLink) return; try { await navigator.clipboard.writeText(shareLink); setCopied(true); window.setTimeout(() => setCopied(false), 2500); } catch { setError("Clipboard access is unavailable. Select and copy the invite link below Share session."); } };
+  const copyLink = async () => { if (!shareLink) return; try { await copyText(shareLink); setCopied(true); window.setTimeout(() => setCopied(false), 2500); } catch { setError("Clipboard access is unavailable. Select and copy the invite link below Share session."); } };
   const openCollaborator = async () => { if (!shareLink) return; try { await (window as DesktopWindow).convergeDesktop?.openCollaboratorWindow({ url: shareLink }); setShareOpen(false); } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not open the invite window."); } };
   const signOut = async () => { setBusy("signout"); try { const result = await authClient.signOut(); if (result.error) throw new Error(result.error.message || "Sign out failed."); applyIdentity(null); setSessionId(null); setSnapshot(null); setAuthOpen(false); } catch (cause) { setError(cause instanceof Error ? cause.message : "Could not sign out."); } finally { setBusy(null); } };
   const joinSession = async () => { if (!invite || busy) return; setBusy("join"); setError(null); try { const result = await api<{ sessionId: string }>("/api/join", { token: invite }); setInvite(null); selectSession(result.sessionId); void loadSessions(); } catch (cause) { setError(cause instanceof Error ? cause.message : "This invite could not be used."); } finally { setBusy(null); } };
@@ -347,7 +358,7 @@ function CodexConnect({ sessionId, desktop, onClose }: { sessionId: string; desk
   }, [sessionId, attempt]);
   const copy = async () => {
     if (!connection) return;
-    try { await navigator.clipboard.writeText(connection.command); setCopied(true); }
+    try { await copyText(connection.command); setCopied(true); }
     catch { setError("Clipboard access is unavailable. Select and copy the command below."); }
   };
   const install = async () => {
