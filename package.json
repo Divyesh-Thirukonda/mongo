@@ -12,7 +12,7 @@
     "desktop": "electron desktop/main.cjs",
     "desktop:package": "node scripts/package-desktop.mjs",
     "verify:store": "node --conditions=react-server --env-file=.env.local --import tsx scripts/verify-store.ts",
-    "verify:collaboration": "node scripts/verify-collaboration.mjs"
+    "verify:recovery": "node --conditions=react-server --env-file=.env.local --import tsx scripts/verify-recovery.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.1",
