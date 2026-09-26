@@ -1,8 +1,8 @@
 # Converge
 
-Converge lets a team guide one coding agent without losing each other's requirements. One person asks for a Stripe product catalog; another asks for `NEW` labels on the three latest products. The harness preserves both authors, identifies the dependency, and steers Codex toward the combined implementation. Conflicting requirements wait for an explicit decision.
+Converge lets a team guide one coding agent without losing each other's requirements. Requests remain attributed, related requests are combined, and conflicting requirements wait for an explicit human decision.
 
-Built for the **Long Horizon Engineering** track: attributed intent, live steering, protected verification, bounded working context, and recoverable source checkpoints. The workspace shows actual agent events, changes, checks, and Atlas state.
+Built for **Long Horizon Engineering**: durable intent, decisions, trajectories, recoverable source, bounded working context, and measured project checks in MongoDB Atlas.
 
 ## Try the shared app
 
@@ -47,20 +47,18 @@ To use the public UI with a local worker, point both services at the same Atlas 
 
 ## Collaborative demo
 
-1. Create a workspace and submit “Connect Stripe and display the product catalog”.
-2. Share an invitation. Join with a second guest identity in another browser or the native guest window.
-3. Submit “Add NEW to the 3 most recently added Stripe products”. The worker sends `turn/steer` if the first turn is active; otherwise it continues the same coding thread.
-4. Open **Preview** for the actual generated website. **Changes** contains source diffs and protected checks.
-5. Submit “Remove all NEW badges” to exercise conflict arbitration. Choose which direction to keep; both original requests remain in the ledger.
-6. Inspect **Memory**, pause, and resume. Atlas checkpoints preserve requirements and the controlled source manifest across worker restarts.
-7. Select a node in **Activity**, open **Change this step**, and describe a correction. The new direction retains its author and a link to the original step; the old history remains visible.
-8. Select a saved checkpoint and choose **Restore this checkpoint** to return to its files and request decisions. The worker stops its coding process first, saves an undo checkpoint, restores, and pauses. Resume or submit a new direction when ready. Older checkpoints without saved request decisions support corrections but cannot restore the full state.
+1. Create a workspace and ask for a website, game, module, or another coding task.
+2. Share an invitation and join as another guest. Add a related requirement while the worker runs; it steers the same coding thread.
+3. Add a contradictory requirement. Both requests remain attributed and work stops for a human choice.
+4. Review the generated **Preview**, source diff and project checks in **Changes**, and the recorded **Activity** graph.
+5. Select a graph node and use **Change this step** to correct a decision. Use **Restore this checkpoint** to return to saved files and decisions without erasing history.
+6. Run `npm run verify:recovery` for a repeatable, no-inference restart proof: one process saves a temporary workspace, another starts with an empty local directory and restores from Atlas. It compares source hashes, intent/decision records, trajectory persistence, and a new authenticated connection's checkpoint/conflict access. It cleans its own records. See `docs/verified-recovery.json` for the last result.
 
-The catalog uses a **Stripe-compatible fixture**, including pagination and inactive products. No live Stripe account, checkout, or payment processing is connected. Starter prompts fill the composer without submitting work.
+New workspaces have a neutral starter. Existing untouched legacy starter instructions are upgraded without deleting generated code. The available execution environment supports local JavaScript/TypeScript and Node tests; external services and dependency installation remain unavailable to the sandbox. Missing capabilities must be reported honestly.
 
 **Preview** bundles the workspace's `index.html` (or `public/index.html`) with local JavaScript, TypeScript, CSS, and SVG assets. It is interactive, refreshes as the worker saves files, and is shared through Atlas. It runs in an isolated iframe without access to session cookies or external connections. It does not start arbitrary application servers or install dependencies; unsupported imports show an actionable error. Source stays in `.converge/workspaces/<session-id>` on the worker (or `CONVERGE_DATA_DIR/workspaces/<session-id>`).
 
-**Connect Codex** issues a workspace-scoped MCP credential that expires after seven days. It exposes shared context, changes, and progress reporting to an external Codex client; it cannot impersonate a human intent submission. The Mac app can add the connection to Codex directly; browser users copy the setup command. The companion skill is in `integrations/codex-plugin/converge`. Treat the connection command and invitation URL as private access links.
+**Connect Codex** issues a workspace-scoped MCP credential that expires after seven days. It exposes authentication/status, shared context, saved checkpoint files, changes, and progress reporting to an external Codex client; it cannot impersonate a human intent submission. The Mac app can add the connection to Codex directly; browser users copy the setup command. The companion skill is in `integrations/codex-plugin/converge`. Treat the connection command and invitation URL as private access links.
 
 ## Execution and limits
 
@@ -70,7 +68,7 @@ The catalog uses a **Stripe-compatible fixture**, including pagination and inact
 - Atlas preserves intents, final trajectory items, checkpoints, and source manifests. Legacy sessions without memberships stay unlisted.
 - History actions use membership checks, idempotency keys, and revision checks. A pending restore blocks concurrent mutations, retains its original recovery point across restarts, and clears the prior Codex thread so stale working context cannot overwrite the restored direction.
 - Source checkpoints include supported root web files and text files in `src`, `tests`, `public`, and `assets`, with a 40-file / 1 MB limit. Unsupported files inside those directories fail capture rather than silently disappearing. Secrets, symlinks, and invalid paths are rejected.
-- Trusted assertions run outside generated code. Unsupported acceptance criteria require review; generated tests cannot declare the work complete.
+- Project tests run in a bounded, read-only sandbox and HTML previews are compiled when present. Passing checks pause the session for human review; project-authored tests do not automatically fulfill every intent.
 - Working context is capped at 16,000 characters and 64 active requirements. Mandatory requirements that cannot fit stop execution instead of being dropped.
 - Each fixed hour admits at most **30 routing/turn operations per workspace, 60 per owner, and 100 across the database**, reserved atomically. These are admission limits, not token, dollar, or provider-subrequest caps. API/auth limits also apply; exhausted work remains saved for a later resume.
 
@@ -81,12 +79,12 @@ The [Codex fork](https://github.com/Divyesh-Thirukonda/codex-converge) is pinned
 ```sh
 npm run typecheck
 npm test
-npm run verify:store
+npm run verify:recovery
 npm run build
 npm run desktop:package
 ```
 
-`npm test` includes auth projections, origin checks, transport isolation, revision/context behavior, source recovery, and protected verification. Optional Atlas integration tests exercise real account linking and atomic budget contention; they create and clean up their own records without model calls:
+`npm test` includes auth projections, origin checks, transport isolation, revision/context behavior, source recovery, and sandboxed project verification. Optional Atlas integration tests exercise real account linking and atomic budget contention; they create and clean up their own records without model calls:
 
 ```sh
 CONVERGE_AUTH_INTEGRATION=1 node --conditions=react-server --env-file=.env.local --import tsx --test tests/auth-isolation.test.ts
@@ -96,4 +94,10 @@ CONVERGE_ATLAS_HISTORY_TEST=1 node --conditions=react-server --env-file=.env.loc
 
 Packaging produces `dist/Converge-darwin-arm64/Converge.app`, an unsigned local Apple Silicon demo. Use `CONVERGE_APP_URL` during packaging for the public UI; the bundle includes its worker and trusted fixture/verifier. Credentials and workspaces remain external; `CONVERGE_ENV_FILE` and `CONVERGE_DATA_DIR` override their locations. Codex itself is not bundled.
 
-See [the architecture](docs/ARCHITECTURE.md) for access boundaries and recovery. The supported verifier covers the storefront fixture, not arbitrary application correctness. No billion-token endurance result is claimed. The earlier AEGIS application remains in Git tag `archive/aegis-final`.
+See [the architecture](docs/ARCHITECTURE.md) for access boundaries and recovery. Automated project checks provide evidence, not proof of arbitrary application correctness. No billion-token endurance result is claimed. The earlier AEGIS application remains in Git tag `archive/aegis-final`.
+
+## New Codex tasks and unattended conflicts
+
+An invitation joins the Converge web workspace. It does **not** authenticate Codex automatically: each collaborator uses **Connect Codex** after joining. A fresh task using that connection reads the same Atlas workspace with `read_shared_context`, `check_status`, and `read_checkpoint`; it does not need the earlier task's in-memory conversation.
+
+The plugin checks status before edit batches and waits on blocked conflicts, pauses, restores, and active managed work. If nobody is present, it leaves the decision blocked. Shared API routes enforce membership and worker leases/revision checks; connected agents cannot write managed files, resolve human conflicts, or certify completion. A status check is not a filesystem lock. Local Codex command permissions still belong to that Codex task, so this is not a guarantee that arbitrary local commands are intercepted.
