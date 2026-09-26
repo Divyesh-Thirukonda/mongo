@@ -20,7 +20,7 @@ export function createCheckpoint(
   const current = intents.filter((intent) => intent.sessionId === session.id && active(intent))
     .sort((a, b) => a.revision - b.revision || a.id.localeCompare(b.id));
   const sourceEventIds = unique(sources.map((event) => event.id));
-  const state = current.map((intent) => ({ id: intent.id, revision: intent.revision, status: intent.status, text: intent.text, decision: intent.decision }));
+  const state = intents.filter((intent) => intent.sessionId === session.id).sort((a, b) => a.revision - b.revision || a.id.localeCompare(b.id)).map((intent) => ({ id: intent.id, revision: intent.revision, status: intent.status, text: intent.text, decision: intent.decision, resolution: intent.resolution }));
   const digest = createHash("sha256").update(JSON.stringify({ sessionId: session.id, revision: session.revision, state, sourceEventIds })).digest("hex").slice(0, 20);
   const decisions = sources.filter((event) => ["routing", "merge", "conflict", "verification"].includes(event.kind)).slice(-16)
     .map((event) => `[event:${event.id}] [intents:${event.intentIds.join(",") || "none"}] ${excerpt(event.title, 120)}: ${excerpt(event.detail, 350)}`);
@@ -41,6 +41,7 @@ export function createCheckpoint(
     eventCount: sources.length,
     contextChars: summary.length + decisions.join("\n").length,
     sourceEventIds,
+    intentState: intents.filter((intent) => intent.sessionId === session.id).map(({ id, status, decision, resolution }) => structuredClone({ id, status, ...(decision ? { decision } : {}), ...(resolution ? { resolution } : {}) })),
     ...(session.codexThreadId ? { codexThreadId: session.codexThreadId } : {}),
   };
   return result;

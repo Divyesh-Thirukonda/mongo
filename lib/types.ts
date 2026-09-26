@@ -72,6 +72,7 @@ export interface Session {
   activeTurnId?: string;
   lastCheckpointAt?: string;
   sourceCheckpointId?: string;
+  historyRequest?: { id: string; checkpointId: string; recoveryCheckpointId?: string; authorId: string; createdAt: string; revision: number; text?: string };
   artifact?: Artifact;
   error?: string;
   pauseRequested?: boolean;
@@ -92,9 +93,13 @@ export interface TrajectoryEvent {
   source?: "managed-worker" | "connected-agent";
   externalTrajectoryId?: string;
   actorUserId?: string;
+  historyAction?: { action: "revise" | "restore"; target: { type: "intent" | "event" | "checkpoint"; id: string }; requestId: string; fromRevision: number; toRevision: number };
   turnId?: string;
 }
 export interface MemoryCheckpoint {
+  intentState?: Array<Pick<Intent, "id" | "status" | "decision" | "resolution">>;
+  /** Derived when reading a snapshot; never part of immutable checkpoint metadata. */
+  restorable?: boolean;
   sourceEventIds?: string[];
   id: string; sessionId: string; createdAt: string; revision: number;
   summary: string; intentIds: string[]; decisions: string[];

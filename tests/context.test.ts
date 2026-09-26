@@ -84,3 +84,13 @@ test("context excludes foreign session evidence and remains valid when only mand
   assert.deepEqual(result.sourceEventIds, []);
   assert.equal(payload(result).historicalEvidence.omittedRecentEventCount, 1);
 });
+
+test("checkpoints retain exact historical request states including retired conflict choices", () => {
+  const active = intent("one"), retired: Intent = { ...intent("two", "superseded"), resolution: "keep-existing" };
+  const sources = [active, retired], current = session(sources);
+  const checkpoint = createCheckpoint(current, sources, [event(1)]);
+  assert.deepEqual(checkpoint.intentState?.find((row) => row.id === retired.id), { id: retired.id, status: "superseded", decision: retired.decision, resolution: "keep-existing" });
+  retired.resolution = "replace-existing";
+  assert.equal(checkpoint.intentState?.find((row) => row.id === retired.id)?.resolution, "keep-existing");
+  assert.notEqual(createCheckpoint(current, sources, [event(1)]).id, checkpoint.id);
+});
