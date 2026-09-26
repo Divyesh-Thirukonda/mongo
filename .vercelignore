@@ -1,0 +1,11 @@
+.git
+.env*
+!.env.example
+.converge
+node_modules
+vendor
+dist
+desktop
+artifacts
+tests
+docs
