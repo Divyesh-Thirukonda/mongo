@@ -1,0 +1,105 @@
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { test } from "node:test";
+import { createCheckpoint } from "../lib/context";
+import { completeHistoryRestore, loadHistoryRestore, requestHistoryAction, setHistoryRestoreBackup } from "../lib/history";
+import { captureWorkspace, commitSourceCheckpoint, readSourceCheckpoint, restoreWorkspaceFiles } from "../lib/source-checkpoint";
+import { acquireLease, applyRouting, closeDatabase, createSession, database, getIntents, getSession, releaseLease, renewLease, resolveIntent, snapshot, submitIntent, updateSession } from "../lib/store";
+import type { Identity, RoutingDecision } from "../lib/types";
+
+const decision = (summary: string, relation: RoutingDecision["relation"] = "start", parents: string[] = []): RoutingDecision => ({ relation, summary, parentIntentIds: parents, reason: summary, acceptance: [summary], source: "rules" });
+
+test("Atlas history corrections are scoped, fenced, idempotent, and restore exact saved requests and web files", { skip: process.env.CONVERGE_ATLAS_HISTORY_TEST !== "1" }, async () => {
+  const user: Identity = { id: randomUUID(), name: "History integration test", isAnonymous: false };
+  const session = await createSession(`History integration ${randomUUID()}`, user);
+  const owner = `history-test-${randomUUID()}`;
+  const root = await realpath(await mkdtemp(join(tmpdir(), "converge-history-")));
+  let timer: ReturnType<typeof setInterval> | undefined;
+  try {
+    assert.equal(await acquireLease(session.id, owner), true);
+    timer = setInterval(() => { void renewLease(session.id, owner); }, 5000);
+    await writeFile(join(root, "index.html"), "<h1>Space bird</h1>");
+    const base = await submitIntent(session.id, user.id, "Build Flappy Bird", randomUUID());
+    await applyRouting(session.id, base.id, decision("Build Flappy Bird"), owner);
+    const space = await submitIntent(session.id, user.id, "Use a space theme", randomUUID());
+    await applyRouting(session.id, space.id, decision("Use space", "extend", [base.id]), owner);
+    const first = await snapshot(session.id), checkpoint = createCheckpoint(first.session, first.intents, first.events);
+    const files = await captureWorkspace(root);
+    await commitSourceCheckpoint(session.id, owner, checkpoint, files);
+    assert.equal((await readSourceCheckpoint(session.id, checkpoint.id))?.checkpoint.intentState?.length, 2);
+    const medieval = await submitIntent(session.id, user.id, "Use a medieval theme", randomUUID());
+    await applyRouting(session.id, medieval.id, decision("Use medieval", "conflict", [space.id]), owner);
+    await resolveIntent(session.id, medieval.id, "keep-existing");
+    const before = await getSession(session.id);
+    const action = { action: "revise" as const, target: { type: "intent" as const, id: medieval.id }, text: "Actually use a medieval theme instead of space", expectedRevision: before.revision, requestId: randomUUID() };
+    const corrected = await requestHistoryAction(session.id, user, action);
+    assert.equal(corrected.revision, before.revision + 1);
+    assert.deepEqual(await requestHistoryAction(session.id, user, action), corrected);
+    let intents = await getIntents(session.id);
+    assert.equal(intents.find((intent) => intent.id === space.id)?.status, "superseded");
+    assert.equal(intents.find((intent) => intent.id === medieval.id)?.status, "superseded");
+    assert.equal(intents.find((intent) => intent.id === base.id)?.status, "accepted");
+    assert.equal(intents.find((intent) => intent.id === corrected.intentId)?.authorId, user.id);
+    await assert.rejects(requestHistoryAction(session.id, user, { ...action, requestId: randomUUID() }), /workspace changed/);
+    await assert.rejects(requestHistoryAction(session.id, { ...user, id: randomUUID() }, { ...action, expectedRevision: corrected.revision, requestId: randomUUID() }), /unavailable/);
+    await assert.rejects(requestHistoryAction(session.id, user, { ...action, target: { type: "event", id: randomUUID() }, expectedRevision: corrected.revision, requestId: randomUUID() }), /not in this workspace/);
+    await writeFile(join(root, "index.html"), "<h1>Wrong direction</h1>");
+    await writeFile(join(root, "later.js"), "// added after checkpoint");
+    await updateSession(session.id, { activeTurnId: "running-turn" }, owner);
+    const restored = await requestHistoryAction(session.id, user, { action: "restore", target: { type: "checkpoint", id: checkpoint.id }, expectedRevision: corrected.revision, requestId: randomUUID() });
+    assert.equal(restored.status, "queued");
+    await assert.rejects(loadHistoryRestore(session.id, owner), /Stop the running agent/);
+    await assert.rejects(submitIntent(session.id, user.id, "Do not race the restore", randomUUID()), /restore/i);
+    await updateSession(session.id, { activeTurnId: undefined }, owner);
+    const pending = await loadHistoryRestore(session.id, owner);
+    assert.ok(pending);
+    const recoveryState = await snapshot(session.id), recoveryCheckpoint = createCheckpoint(recoveryState.session, recoveryState.intents, recoveryState.events);
+    await commitSourceCheckpoint(session.id, owner, recoveryCheckpoint, await captureWorkspace(root));
+    await setHistoryRestoreBackup(session.id, owner, pending.request.id, recoveryCheckpoint.id);
+    await setHistoryRestoreBackup(session.id, owner, pending.request.id, recoveryCheckpoint.id);
+    await assert.rejects(setHistoryRestoreBackup(session.id, "other-worker", pending.request.id, recoveryCheckpoint.id), /lease/);
+    await assert.rejects(setHistoryRestoreBackup(session.id, owner, randomUUID(), recoveryCheckpoint.id), /lease/);
+    await assert.rejects(setHistoryRestoreBackup(session.id, owner, pending.request.id, checkpoint.id), /revision/);
+    await restoreWorkspaceFiles(root, pending.files);
+    // A crash here leaves the original immutable undo point available on retry.
+    const retried = await loadHistoryRestore(session.id, owner);
+    assert.equal(retried?.request.recoveryCheckpointId, recoveryCheckpoint.id);
+    const backup = await readSourceCheckpoint(session.id, retried!.request.recoveryCheckpointId);
+    assert.equal(backup?.files.find((file) => file.path === "index.html")?.content, "<h1>Wrong direction</h1>");
+    await completeHistoryRestore(session.id, owner, pending.request.id);
+    assert.equal(await readFile(join(root, "index.html"), "utf8"), "<h1>Space bird</h1>");
+    await assert.rejects(readFile(join(root, "later.js")), { code: "ENOENT" });
+    const current = await getSession(session.id);
+    assert.equal(current.revision, restored.revision);
+    assert.equal(current.status, "paused");
+    assert.equal(current.historyRequest, undefined);
+    assert.equal(current.codexThreadId, undefined);
+    intents = await getIntents(session.id);
+    assert.equal(intents.find((intent) => intent.id === space.id)?.status, "accepted");
+    assert.equal(intents.find((intent) => intent.id === medieval.id)?.status, "superseded");
+    assert.equal(intents.find((intent) => intent.id === corrected.intentId)?.status, "superseded");
+    const after = await snapshot(session.id);
+    assert.ok(after.events.some((event) => event.title === "Direction revised"));
+    assert.ok(after.events.some((event) => event.title === "Checkpoint restored" && event.historyAction?.target.id === checkpoint.id));
+    // Legacy source-only checkpoints cannot claim to undo request decisions.
+    const legacy = { ...checkpoint, id: `checkpoint-legacy-${randomUUID()}` };
+    delete legacy.intentState;
+    await commitSourceCheckpoint(session.id, owner, legacy, files);
+    await assert.rejects(requestHistoryAction(session.id, user, { action: "restore", target: { type: "checkpoint", id: legacy.id }, expectedRevision: current.revision, requestId: randomUUID() }), /older checkpoint/);
+    // Both immutable source and state metadata are authenticated by their checksums.
+    const db = await database();
+    await db.collection("cv_checkpoints").updateOne({ id: checkpoint.id, sessionId: session.id }, { $set: { summary: "tampered" } });
+    await assert.rejects(readSourceCheckpoint(session.id, checkpoint.id), /integrity/);
+  } finally {
+    if (timer) clearInterval(timer);
+    await updateSession(session.id, { pauseRequested: true, status: "paused" }, owner).catch(() => {});
+    await releaseLease(session.id, owner);
+    const db = await database();
+    for (const name of ["cv_sessions", "cv_intents", "cv_events", "cv_checkpoints", "cv_source_checkpoints", "cv_history_actions", "cv_memberships", "cv_participants", "cv_trajectory", "cv_token_usage"]) await db.collection(name).deleteMany(name === "cv_sessions" ? { id: session.id } : { sessionId: session.id });
+    await rm(root, { recursive: true, force: true });
+    await closeDatabase();
+  }
+});

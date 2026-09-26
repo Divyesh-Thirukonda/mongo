@@ -74,6 +74,7 @@ export async function submitIntent(sessionId:string,authorId:PersonId,text:strin
     const prior=await col.findOne({_id:key},{session:tx});
     if(prior){if(prior.text!==text.trim()||prior.authorId!==authorId)throw new StoreError("This request ID belongs to a different intent",409);return cleanIntent(prior);}
     const session=await sessions(db).findOne({_id:sessionId},{session:tx});if(!session)throw new StoreError("Session not found",404);
+    if(session.historyRequest)throw new StoreError("A checkpoint restore is pending. Wait for it to finish before adding a request.",409);
     const active=await col.countDocuments({sessionId,status:{$nin:["superseded","duplicate"]}},{session:tx});
     if(active>=64)throw new StoreError("This session has 64 active requirements. Start a new session to keep every contributor's intent in context.",409);
     const intent:Intent={id:randomUUID(),sessionId,authorId,text:text.trim(),createdAt:now(),revision:session.revision+1,status:"queued"};
@@ -85,6 +86,7 @@ export async function submitIntent(sessionId:string,authorId:PersonId,text:strin
 export async function applyRouting(sessionId:string,intentId:string,decision:RoutingDecision,owner:string):Promise<Intent> {
   return transaction(async(db,tx)=>{
     const current=await sessions(db).findOne({_id:sessionId,leaseOwner:owner,leaseUntil:{$gt:now()}},{session:tx});if(!current)throw new StoreError("Worker lease changed",409);
+    if(current.historyRequest)throw new StoreError("A checkpoint restore is waiting for the worker boundary.",409);
     const col=db.collection<IntentDoc>("cv_intents");const doc=await col.findOne({sessionId,id:intentId},{session:tx});if(!doc)throw new StoreError("Intent not found",404);if(doc.status!=="queued")return cleanIntent(doc);
     const status=decision.relation==="conflict"?"blocked":decision.relation==="duplicate"?"duplicate":"accepted";
     await col.updateOne({_id:doc._id},{$set:{decision,status}},{session:tx});
@@ -99,6 +101,7 @@ export async function resolveIntent(sessionId:string,intentId:string,choice:"kee
   await transaction(async(db,tx)=>{
     const col=db.collection<IntentDoc>("cv_intents"); const intent=await col.findOne({sessionId,id:intentId},{session:tx});if(!intent||intent.status!=="blocked")throw new StoreError("This conflict is no longer open",409);
     const current=await sessions(db).findOne({_id:sessionId},{session:tx});if(!current)throw new StoreError("Session not found",404);
+    if(current.historyRequest)throw new StoreError("A checkpoint restore is pending. Wait for it to finish before changing a decision.",409);
     if(choice==="replace-existing")await col.updateMany({sessionId,id:{$in:intent.decision?.parentIntentIds??[]}},{$set:{status:"superseded"}},{session:tx});
     await col.updateOne({_id:intent._id},{$set:{status:choice==="keep-existing"?"superseded":"accepted",resolution:choice}},{session:tx});
     const intents=(await col.find({sessionId},{session:tx}).sort({revision:1}).toArray()).map(cleanIntent);
@@ -135,6 +138,7 @@ export async function recordTokenUsage(id:string,threadId:string,total:number,ow
 export async function completeRevision(id:string,revision:number,patch:Partial<Session>,owner:string) {
   return transaction(async(db,tx)=>{
     const current=await sessions(db).findOne({_id:id,leaseOwner:owner,leaseUntil:{$gt:now()}},{session:tx});if(!current)throw new StoreError("Worker lease changed",409);
+    if(current.historyRequest)return false;
     const blocked=await db.collection<IntentDoc>("cv_intents").countDocuments({sessionId:id,status:"blocked"},{session:tx});
     const queued=await db.collection<IntentDoc>("cv_intents").countDocuments({sessionId:id,status:"queued"},{session:tx});
     const stale=current.revision!==revision||queued>0;
@@ -145,11 +149,18 @@ export async function completeRevision(id:string,revision:number,patch:Partial<S
     return !stale&&!current.pauseRequested;
   });
 }
-export async function controlSession(id:string,action:"pause"|"resume"|"retry") { const session=await getSession(id);await updateSession(id,{pauseRequested:action==="pause",status:action==="pause"?"paused":"planning",...(action==="retry"?{processedRevision:Math.max(0,session.revision-1)}:{}),error:undefined});await appendEvent(id,{kind:"system",actor:"Team",title:action==="pause"?"Work paused at the next safe boundary":"Work resumed",detail:"The shared intent ledger and coding thread are preserved.",intentIds:[]}); }
+export async function controlSession(id:string,action:"pause"|"resume"|"retry") {
+  await transaction(async(db,tx)=>{
+    const session=await sessions(db).findOne({_id:id},{session:tx});if(!session)throw new StoreError("Session not found",404);
+    if(session.historyRequest)throw new StoreError("A checkpoint restore is pending. Wait for it to finish before changing execution.",409);
+    await sessions(db).updateOne({_id:id},{$set:{pauseRequested:action==="pause",status:action==="pause"?"paused":"planning",...(action==="retry"?{processedRevision:Math.max(0,session.revision-1)}:{}),updatedAt:now()},$unset:{error:""}},{session:tx});
+    await eventInTx(db,tx,id,{kind:"system",actor:"Team",title:action==="pause"?"Work paused at the next safe boundary":"Work resumed",detail:"The shared intent ledger and coding thread are preserved.",intentIds:[]});
+  });
+}
 export async function acquireLease(id:string,owner:string):Promise<boolean> { const result=await sessions(await database()).findOneAndUpdate({_id:id,$or:[{leaseUntil:{$lt:now()}},{leaseUntil:{$exists:false}},{leaseOwner:owner}]},{$set:{leaseOwner:owner,leaseUntil:new Date(Date.now()+30000).toISOString()}});return Boolean(result); }
 export async function renewLease(id:string,owner:string):Promise<boolean> {const result=await sessions(await database()).updateOne({_id:id,leaseOwner:owner,leaseUntil:{$gt:now()}},{$set:{leaseUntil:new Date(Date.now()+30000).toISOString()}});return Boolean(result.matchedCount);}
 export async function releaseLease(id:string,owner:string) {await sessions(await database()).updateOne({_id:id,leaseOwner:owner},{$unset:{leaseOwner:"",leaseUntil:""}});}
-export async function pendingSessions():Promise<Session[]> {return (await sessions(await database()).find({pauseRequested:{$ne:true},status:{$in:["planning","running","review"]}}).sort({updatedAt:1}).limit(20).toArray()).map(cleanSession);}
+export async function pendingSessions():Promise<Session[]> {return (await sessions(await database()).find({$or:[{historyRequest:{$exists:true}},{pauseRequested:{$ne:true},status:{$in:["planning","running","review"]}}]}).sort({updatedAt:1}).limit(20).toArray()).map(cleanSession);}
 export async function heartbeatWorker(id:string,engine:string,host:string){await(await database()).collection<WorkerDoc>("cv_workers").updateOne({_id:id},{$set:{engine,host,seenAt:new Date()}},{upsert:true});}
 export async function presence(sessionId:string,personId:PersonId){await getSession(sessionId);await(await database()).collection("cv_presence").updateOne({sessionId,personId},{$set:{seenAt:now(),expiresAt:new Date(Date.now()+45000)}},{upsert:true});}
 export async function snapshot(id:string):Promise<SessionSnapshot>{
@@ -159,9 +170,10 @@ export async function snapshot(id:string):Promise<SessionSnapshot>{
   const intents=(await db.collection<IntentDoc>("cv_intents").find({sessionId:id},{session:tx}).sort({revision:1}).toArray()).map(cleanIntent);
   const events=await db.collection<EventDoc>("cv_events").find({sessionId:id},{session:tx}).sort({sequence:-1}).limit(100).toArray();
   const checkpoints=await db.collection<CheckpointDoc>("cv_checkpoints").find({sessionId:id},{session:tx}).sort({createdAt:-1}).limit(8).toArray();
+  const savedSources=new Set((await db.collection<{_id:string}>("cv_source_checkpoints").find({_id:{$in:checkpoints.map(c=>c.id)},sessionId:id},{session:tx,projection:{_id:1}}).toArray()).map(c=>c._id));
   const people=await db.collection<Presence>("cv_presence").find({sessionId:id,seenAt:{$gt:new Date(Date.now()-45000).toISOString()}},{session:tx}).toArray();
   const worker=await db.collection<WorkerDoc>("cv_workers").find({seenAt:{$gt:new Date(Date.now()-20000)}},{session:tx}).sort({seenAt:-1}).limit(1).next();
-  return {session,intents,participants:[],currentUserId:"",events:events.reverse().map(({_id,...e})=>{void _id;return e;}),checkpoints:checkpoints.map(({_id,...c})=>{void _id;return c;}),presence:people.map(p=>({sessionId:p.sessionId,personId:p.personId,seenAt:p.seenAt})),worker:{online:Boolean(worker),engine:worker?.engine??"Codex App Server",lastSeenAt:worker?.seenAt.toISOString()},storage:{mode:"atlas",connected:true}};
+  return {session,intents,participants:[],currentUserId:"",events:events.reverse().map(({_id,...e})=>{void _id;return e;}),checkpoints:checkpoints.map(({_id,...c})=>{void _id;return {...c,restorable:Boolean(c.intentState&&savedSources.has(c.id))};}),presence:people.map(p=>({sessionId:p.sessionId,personId:p.personId,seenAt:p.seenAt})),worker:{online:Boolean(worker),engine:worker?.engine??"Codex App Server",lastSeenAt:worker?.seenAt.toISOString()},storage:{mode:"atlas",connected:true}};
   });
 }
 export async function recordTrajectory(sessionId:string,turnId:string|undefined,method:string,payload:unknown){
