@@ -96,3 +96,40 @@ test("unsupported files, credentials, non-UTF8 data, and size/count limits fail 
     assert.throws(() => validateSourceFiles([file("src/a.js", "é".repeat(300000)), file("src/b.js", "é".repeat(300000))]), /1 MB/);
   } finally { await f.cleanup(); }
 });
+
+test("web checkpoints preserve runnable root entry points and text assets through restore", async () => {
+  const f = await fixture();
+  try {
+    await mkdir(join(f.root, "assets"));
+    await mkdir(join(f.root, "public"));
+    await writeFile(join(f.root, "index.html"), '<script type="module" src="./src/game.js"></script>');
+    await writeFile(join(f.root, "style.css"), "canvas { width: 100%; }");
+    await writeFile(join(f.root, "src", "game.js"), "export const score = 1;");
+    await writeFile(join(f.root, "assets", "bird.svg"), '<svg xmlns="http://www.w3.org/2000/svg"/>');
+    await writeFile(join(f.root, "public", "rules.txt"), "Tap to flap");
+    const before = await captureWorkspace(f.root);
+    await writeFile(join(f.root, "index.html"), "wrong direction");
+    await writeFile(join(f.root, "extra.js"), "a later file");
+    await restoreWorkspaceFiles(f.root, before);
+    assert.deepEqual(await captureWorkspace(f.root), before);
+    await assert.rejects(readFile(join(f.root, "extra.js")), { code: "ENOENT" });
+  } finally { await f.cleanup(); }
+});
+
+test("restore refuses unsupported current source instead of silently deleting it", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.root, "src", "image.png"), "keep this unsupported asset");
+    await assert.rejects(restoreWorkspaceFiles(f.root, [file("index.html", "old page")]), /Unsupported source file/);
+    assert.equal(await readFile(join(f.root, "src", "image.png"), "utf8"), "keep this unsupported asset");
+  } finally { await f.cleanup(); }
+});
+
+test("legacy source manifests do not delete newer root web files", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(join(f.root, "index.html"), "new game");
+    await restoreWorkspaceFiles(f.root, [file("src/old.js", "old file")], { legacySurface: true });
+    assert.equal(await readFile(join(f.root, "index.html"), "utf8"), "new game");
+  } finally { await f.cleanup(); }
+});

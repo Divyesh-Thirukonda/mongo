@@ -9,16 +9,24 @@ import { database, redact, StoreError, transaction } from "./store";
 
 const MAX_BYTES = 1024 * 1024;
 const MAX_FILES = 40;
-const CONTROLLED = ["src", "tests", "package.json", "README.md"] as const;
+const SOURCE_DIRS = ["src", "tests", "public", "assets"] as const;
+const LEGACY_CONTROLLED = ["src", "tests", "package.json", "README.md"] as const;
+const WEB_EXTENSION = /\.(html?|css|js|mjs|cjs|jsx|ts|tsx|json|md|txt|svg)$/i;
+const ROOT_WEB_EXTENSION = /\.(html?|css|js|mjs|cjs|jsx|ts|tsx|json|svg)$/i;
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 export interface SourceFile { path: string; content: string; sha256: string }
-type SourceBundle = { _id: string; version: 1; sessionId: string; revision: number; createdAt: string; files: SourceFile[]; sha256: string; metadataSha256: string };
+type SourceBundle = { _id: string; version: 1 | 2; sessionId: string; revision: number; createdAt: string; files: SourceFile[]; sha256: string; metadataSha256: string };
 
 function supportedPath(path: string): boolean {
-  if (path === "package.json" || path === "README.md") return true;
-  if (path.length > 240 || !/^(src|tests)\/.+\.(js|json|md)$/.test(path)) return false;
+  if (path.length > 240 || !WEB_EXTENSION.test(path)) return false;
   const segments = path.split("/");
-  return segments.length <= 14 && segments.every((segment) => /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$/.test(segment) && segment !== "." && segment !== "..");
+  if (segments.length > 14 || !segments.every((segment) => /^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$/.test(segment) && segment !== "." && segment !== "..")) return false;
+  return segments.length === 1 ? (path === "README.md" || ROOT_WEB_EXTENSION.test(path)) : SOURCE_DIRS.includes(segments[0] as typeof SOURCE_DIRS[number]);
+}
+
+async function controlledTargets(root: string): Promise<string[]> {
+  const roots = (await readdir(root)).filter((name) => !name.startsWith(".") && ROOT_WEB_EXTENSION.test(name));
+  return [...new Set([...SOURCE_DIRS, "package.json", "README.md", ...roots])].sort();
 }
 
 const filesSchema = z.array(z.object({ path: z.string().max(240).refine(supportedPath), content: z.string().max(MAX_BYTES), sha256: z.string().regex(/^[a-f0-9]{64}$/) }).strict()).max(MAX_FILES);
@@ -64,7 +72,7 @@ export async function captureWorkspace(root: string): Promise<SourceFile[]> {
     if (info.isSymbolicLink() || await realpath(path) !== path) throw new Error("Source checkpoint cannot contain symlinks.");
     const rel = relative(root, path);
     if (info.isDirectory()) {
-      if (!(rel === "src" || rel === "tests" || /^(src|tests)\/[a-zA-Z0-9_./-]+$/.test(rel)) || rel.split("/").length > 13) throw new Error("Unsupported source directory.");
+      if (!/^(src|tests|public|assets)(\/[a-zA-Z0-9_./-]+)?$/.test(rel) || rel.split("/").length > 13) throw new Error("Unsupported source directory.");
       for (const name of (await readdir(path)).sort()) await walk(join(path, name));
       return;
     }
@@ -91,7 +99,7 @@ export async function captureWorkspace(root: string): Promise<SourceFile[]> {
       files.push({ path: rel, content, sha256: hash(content) });
     } finally { await handle.close(); }
   };
-  for (const target of CONTROLLED) await walk(join(root, target));
+  for (const target of await controlledTargets(root)) await walk(join(root, target));
   return validateSourceFiles(files);
 }
 
@@ -101,15 +109,15 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function bundleDigest(sessionId: string, revision: number, files: SourceFile[]): string {
-  return hash(canonicalJson({ version: 1, sessionId, revision, files }));
+function bundleDigest(sessionId: string, revision: number, files: SourceFile[], version: 1 | 2 = 2): string {
+  return hash(canonicalJson({ version, sessionId, revision, files }));
 }
 
 /** Files, memory metadata, and the current source pointer commit together under the worker lease. */
 export async function commitSourceCheckpoint(sessionId: string, owner: string, checkpoint: MemoryCheckpoint, input: SourceFile[]): Promise<void> {
   if (checkpoint.sessionId !== sessionId || !checkpoint.id || !Number.isSafeInteger(checkpoint.revision) || checkpoint.revision < 0) throw new Error("Source checkpoint identity mismatch.");
   const files = validateSourceFiles(input);
-  const bundle: SourceBundle = { _id: checkpoint.id, version: 1, sessionId, revision: checkpoint.revision, createdAt: checkpoint.createdAt, files, sha256: bundleDigest(sessionId, checkpoint.revision, files), metadataSha256: hash(canonicalJson(checkpoint)) };
+  const bundle: SourceBundle = { _id: checkpoint.id, version: 2, sessionId, revision: checkpoint.revision, createdAt: checkpoint.createdAt, files, sha256: bundleDigest(sessionId, checkpoint.revision, files), metadataSha256: hash(canonicalJson(checkpoint)) };
   await transaction(async (db, tx) => {
     const session = db.collection<{ _id: string; sourceCheckpointId?: string; leaseOwner?: string; leaseUntil?: string }>("cv_sessions");
     const fence = await session.updateOne({ _id: sessionId, leaseOwner: owner, leaseUntil: { $gt: new Date().toISOString() } }, { $set: { sourceCheckpointId: checkpoint.id, lastCheckpointAt: checkpoint.createdAt } }, { session: tx });
@@ -137,11 +145,14 @@ async function rejectSymlinks(path: string, budget: { entries: number }): Promis
 }
 
 /** Use only with a stopped agent/new fixture. Staging and rollback avoid leaving a partial restore. */
-export async function restoreWorkspaceFiles(root: string, input: SourceFile[]): Promise<void> {
+export async function restoreWorkspaceFiles(root: string, input: SourceFile[], options: { legacySurface?: boolean } = {}): Promise<void> {
   const files = validateSourceFiles(input);
   root = await canonicalRoot(root);
+  // Refuse to discard unsupported source entries. Uncontrolled files stay untouched.
+  await captureWorkspace(root);
+  const targets = options.legacySurface ? [...LEGACY_CONTROLLED] : [...new Set([...(await controlledTargets(root)), ...files.map((file) => file.path.split("/")[0])])].sort();
   const budget = { entries: 0 };
-  for (const target of CONTROLLED) await rejectSymlinks(join(root, target), budget);
+  for (const target of targets) await rejectSymlinks(join(root, target), budget);
   const stage = join(root, `.converge-restore-${randomUUID()}`);
   await mkdir(join(stage, "next"), { recursive: true });
   await mkdir(join(stage, "previous"));
@@ -153,7 +164,7 @@ export async function restoreWorkspaceFiles(root: string, input: SourceFile[]): 
       await mkdir(dirname(destination), { recursive: true });
       await writeFile(destination, file.content, { flag: "wx", mode: 0o600 });
     }
-    for (const target of CONTROLLED) {
+    for (const target of targets) {
       const destination = join(root, target);
       await rejectSymlinks(destination, { entries: 0 });
       if (await optionalStat(destination)) { await rename(destination, join(stage, "previous", target)); moved.push(target); }
@@ -172,16 +183,29 @@ export async function restoreWorkspaceFiles(root: string, input: SourceFile[]): 
   } finally { if (cleanup) await rm(stage, { recursive: true, force: true }); }
 }
 
+/** Read and verify both the immutable source manifest and the saved memory metadata. */
+export async function readSourceCheckpoint(sessionId: string, checkpointId?: string): Promise<{ files: SourceFile[]; checkpoint: MemoryCheckpoint; version: 1 | 2 } | null> {
+  const db = await database();
+  if (!checkpointId) {
+    const session = await db.collection<{ _id: string; sourceCheckpointId?: string }>("cv_sessions").findOne({ _id: sessionId });
+    if (!session) throw new StoreError("Session not found", 404);
+    checkpointId = session.sourceCheckpointId;
+  }
+  if (!checkpointId) return null;
+  const bundle = await db.collection<SourceBundle>("cv_source_checkpoints").findOne({ _id: checkpointId, sessionId });
+  const memory = await db.collection<MemoryCheckpoint & { _id: string }>("cv_checkpoints").findOne({ _id: checkpointId, sessionId });
+  if (!bundle || !memory || ![1, 2].includes(bundle.version) || !Number.isSafeInteger(bundle.revision)) throw new StoreError("The selected source checkpoint is missing or invalid.", 409);
+  const files = validateSourceFiles(bundle.files);
+  if (bundleDigest(sessionId, bundle.revision, files, bundle.version) !== bundle.sha256) throw new StoreError("Source bundle integrity check failed.", 409);
+  const { _id, ...checkpoint } = memory; void _id;
+  if (hash(canonicalJson(checkpoint)) !== bundle.metadataSha256) throw new StoreError("Checkpoint request-state integrity check failed.", 409);
+  return { files, checkpoint, version: bundle.version };
+}
+
 /** Restore exactly the manifest selected by the transactionally committed session pointer. */
 export async function restoreSourceCheckpoint(root: string, sessionId: string): Promise<boolean> {
-  const db = await database();
-  const session = await db.collection<{ _id: string; sourceCheckpointId?: string }>("cv_sessions").findOne({ _id: sessionId });
-  if (!session) throw new StoreError("Session not found", 404);
-  if (!session.sourceCheckpointId) return false;
-  const bundle = await db.collection<SourceBundle>("cv_source_checkpoints").findOne({ _id: session.sourceCheckpointId, sessionId });
-  if (!bundle || bundle.version !== 1 || !Number.isSafeInteger(bundle.revision)) throw new Error("The selected source checkpoint is missing or invalid.");
-  const files = validateSourceFiles(bundle.files);
-  if (bundleDigest(sessionId, bundle.revision, files) !== bundle.sha256) throw new Error("Source bundle integrity check failed.");
-  await restoreWorkspaceFiles(root, files);
+  const source = await readSourceCheckpoint(sessionId);
+  if (!source) return false;
+  await restoreWorkspaceFiles(root, source.files, { legacySurface: source.version === 1 });
   return true;
 }
