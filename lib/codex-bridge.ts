@@ -95,6 +95,9 @@ export class CodexBridge {
   private nextId = 0;
   private buffer = "";
   private closed = false;
+  private processGroupStopped = false;
+  private processStreamsClosed = false;
+  private closing?: Promise<void>;
   private initialized = false;
   private pending = new Map<number, Pending>();
   private threadCwds = new Map<string, string>();
@@ -127,8 +130,10 @@ export class CodexBridge {
     const binary = await realpath(this.options.binary ?? process.env.CONVERGE_CODEX_BINARY ?? CODEX_BINARY).catch(() => {
       throw new CodexBridgeError("Could not locate the Codex app-server executable.", "SPAWN_FAILED");
     });
-    const child = spawn(binary, codexProviderArguments(this.model, env, this.root, binary), { cwd: this.root, env, stdio: ["pipe", "pipe", "pipe"], shell: false });
+    if (this.closed) throw new CodexBridgeError("The bridge was closed during startup.", "CLOSED");
+    const child = spawn(binary, codexProviderArguments(this.model, env, this.root, binary), { cwd: this.root, env, stdio: ["pipe", "pipe", "pipe"], shell: false, detached: process.platform !== "win32" });
     this.child = child;
+    child.once("close", () => { this.processStreamsClosed = true; });
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.receive(chunk));
     // Drain stderr without retaining potentially sensitive user-config diagnostics.
@@ -181,7 +186,6 @@ export class CodexBridge {
       if (!message || typeof message !== "object" || Array.isArray(message)) { this.fail(new CodexBridgeError("Codex emitted an invalid RPC envelope.", "INVALID_RPC")); return; }
       try { this.handle(message as Record<string, unknown>); }
       catch { this.fail(new CodexBridgeError("Codex transport could not process an RPC message.", "INVALID_RPC")); }
-      if (this.closed) return;
     }
     if (Buffer.byteLength(this.buffer) > 8 * 1024 * 1024) this.fail(new CodexBridgeError("Codex output exceeded the message limit.", "MESSAGE_TOO_LARGE"));
   }
@@ -189,6 +193,7 @@ export class CodexBridge {
   private handle(message: Record<string, unknown>): void {
     if (typeof message.method === "string") {
       if (typeof message.id === "number" || typeof message.id === "string") {
+        if (this.closed) return; // Closing drains notifications; it cannot authorize another server request.
         const request = message as unknown as CodexServerRequest;
         this.denyServerRequest(request);
         this.queueEvent(() => this.options.onServerRequest?.(request));
@@ -350,18 +355,53 @@ export class CodexBridge {
     this.pending.clear();
     for (const set of this.turnWaiters.values()) for (const waiter of set) { clearTimeout(waiter.timer); waiter.reject(error); }
     this.turnWaiters.clear(); this.activeTurns.clear();
-    this.child?.kill("SIGTERM");
+    this.signalOwnedProcessGroup("SIGTERM");
     try { this.options.onError?.(error); } catch { /* An error observer must not strand transport cleanup. */ }
   }
 
-  async close(): Promise<void> {
+  private signalOwnedProcessGroup(signal: NodeJS.Signals): void {
+    if (!this.child?.pid || this.processGroupStopped) return;
+    try {
+      if (process.platform === "win32") this.child.kill(signal);
+      else process.kill(-this.child.pid, signal);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+    // Sending a signal is not proof that the process group has stopped.
+  }
+
+  private ownedProcessGroupExists(): boolean {
+    if (!this.child?.pid || this.processGroupStopped) return false;
+    if (process.platform === "win32") return this.child.exitCode === null && this.child.signalCode === null;
+    try { process.kill(-this.child.pid, 0); return true; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      this.processGroupStopped = true;
+      return false;
+    }
+  }
+
+  close(): Promise<void> {
+    this.closing ??= this.closeProcess();
+    return this.closing;
+  }
+
+  private async closeProcess(): Promise<void> {
     const child = this.child;
     if (!this.closed) this.fail(new CodexBridgeError("Codex bridge closed.", "CLOSED"));
-    if (child && child.exitCode === null && child.signalCode === null) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(() => { child.kill("SIGKILL"); resolve(); }, 1500);
-        child.once("exit", () => { clearTimeout(timer); resolve(); });
-      });
+    if (child) {
+      const graceDeadline = Date.now() + 1500;
+      while (child.exitCode === null && child.signalCode === null && !this.processStreamsClosed && Date.now() < graceDeadline) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
+      // A tool may outlive its app-server parent. Kill once, then observe actual
+      // group disappearance and stdio closure before allowing a source restore.
+      this.signalOwnedProcessGroup("SIGKILL");
+      const deadline = Date.now() + 5000;
+      while (this.ownedProcessGroupExists() || !this.processStreamsClosed) {
+        if (Date.now() >= deadline) throw new CodexBridgeError("The coding process did not fully stop. Source files must not be restored yet.", "STOP_TIMEOUT");
+        await new Promise<void>((resolve) => setTimeout(resolve, 10));
+      }
     }
     await this.flushEvents();
   }

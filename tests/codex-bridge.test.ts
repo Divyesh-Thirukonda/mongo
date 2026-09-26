@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -31,6 +31,15 @@ createInterface({input:process.stdin}).on('line',line=>{
  if(m.method==='fixture/approval'){send({id:'approval-request',method:'item/commandExecution/requestApproval',params:{command:'network operation'}});send({id:m.id,result:{}});return;}
  if(m.method==='fixture/late'){setTimeout(()=>send({id:m.id,result:{late:true}}),60);return;}
  if(m.method==='fixture/exit'){process.exit(0);return;}
+ if(m.method==='fixture/pid'){send({id:m.id,result:{pid:process.pid}});return;}
+ if(m.method==='fixture/shutdownNotifications'){
+  process.on('SIGTERM',()=>{send({method:'fixture/final-one'});send({method:'fixture/final-two'});setTimeout(()=>process.exit(0),30);});
+  send({id:m.id,result:{}});return;
+ }
+ if(m.method==='fixture/spawnWriter'){
+  const child=require('node:child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>require('node:fs').appendFileSync(process.argv[1],'x'),10)",m.params.path],{stdio:'ignore'});
+  send({id:m.id,result:{pid:child.pid}});return;
+ }
  if(m.method==='fixture/malformed'){process.stdout.write('not-json\\n');return;}
  if(m.method==='fixture/error'){send({id:m.id,error:{code:-32600,message:process.env.OPENROUTER_API_KEY}});return;}
  if(m.method==='fixture/partial'){const line=JSON.stringify({id:m.id,result:{unicode:'résumé'}})+'\\n';process.stdout.write(line.slice(0,10));setTimeout(()=>process.stdout.write(line.slice(10)),5);return;}
@@ -171,4 +180,81 @@ test("newly exposed MCP tools stop the worker before the next turn is submitted"
     assert.equal(f.bridge.isStarted, false);
     assert.ok(!seen.includes("turn/started"));
   } finally { await f.cleanup(); }
+});
+
+test("closing the bridge stops tool descendants before workspace restoration", { skip: process.platform === "win32" }, async () => {
+  const f = await fixture();
+  try {
+    await f.bridge.start();
+    const marker = join(f.workspace, "tool-writes.txt");
+    await f.bridge.request("fixture/spawnWriter", { path: marker });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await readFile(marker).then(bytes => bytes.length > 0).catch(() => false)) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    assert.ok((await readFile(marker)).length > 0, "tool must have written before close");
+    await f.bridge.close();
+    const atStop = "restored checkpoint";
+    await writeFile(marker, atStop);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    assert.equal(await readFile(marker, "utf8"), atStop, "closed tools must not overwrite restored files");
+  } finally { await f.cleanup(); }
+});
+
+
+test("concurrent close callers wait for final stdout notifications and their durable handlers", async () => {
+  const persisted: string[] = [];
+  const f = await fixture(async (event) => {
+    if (event.method.startsWith("fixture/final-")) {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      persisted.push(event.method);
+    }
+  });
+  try {
+    await f.bridge.start();
+    await f.bridge.request("fixture/shutdownNotifications");
+    const first = f.bridge.close(), second = f.bridge.close();
+    assert.equal(first, second, "all callers must share the same stop boundary");
+    await first;
+    assert.deepEqual(persisted, ["fixture/final-one", "fixture/final-two"]);
+  } finally { await f.cleanup(); }
+});
+
+
+test("closing during asynchronous startup prevents a later unmanaged process spawn", async () => {
+  const f = await fixture();
+  try {
+    const startup = f.bridge.start();
+    await f.bridge.close();
+    await assert.rejects(startup, (error: unknown) => error instanceof CodexBridgeError && error.code === "CLOSED");
+    assert.equal(f.bridge.isStarted, false);
+  } finally { await f.cleanup(); }
+});
+
+test("a surviving process group rejects shutdown instead of allowing a false restore boundary", { skip: process.platform === "win32" }, async () => {
+  const f = await fixture();
+  const signal = process.kill;
+  let group: number | undefined;
+  try {
+    await f.bridge.start();
+    const processInfo = await f.bridge.request<{ pid: number }>("fixture/pid");
+    group = -processInfo.pid;
+    const marker = join(f.workspace, "tool-writes.txt");
+    await f.bridge.request("fixture/spawnWriter", { path: marker });
+    for (let attempt = 0; attempt < 100; attempt++) {
+      if (await readFile(marker).then((bytes) => bytes.length > 0).catch(() => false)) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    // Simulate the OS accepting a kill request while its group remains alive.
+    process.kill = ((pid: number, kind?: NodeJS.Signals | number) => pid === group && kind === "SIGKILL" ? true : signal(pid, kind)) as typeof process.kill;
+    await assert.rejects(f.bridge.close(), (error: unknown) => error instanceof CodexBridgeError && error.code === "STOP_TIMEOUT");
+  } finally {
+    process.kill = signal;
+    if (group !== undefined) { try { signal(group, "SIGKILL"); } catch {} }
+    for (let attempt = 0; attempt < 100; attempt++) {
+      try { if (group !== undefined) signal(group, 0); } catch { break; }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await rm(f.directory, { recursive: true, force: true });
+  }
 });
