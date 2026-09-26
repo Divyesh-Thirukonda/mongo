@@ -6,4 +6,7 @@ node_modules/
 *.tsbuildinfo
 .DS_Store
 artifacts/
+.converge/
+dist/
+desktop/build/
 .vercel

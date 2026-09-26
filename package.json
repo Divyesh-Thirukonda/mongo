@@ -1,34 +1,35 @@
 {
-  "name": "aegis-war-room",
+  "name": "converge",
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --hostname 0.0.0.0",
+    "dev": "next dev --hostname 127.0.0.1",
     "build": "next build",
-    "start": "next start --hostname 0.0.0.0",
+    "start": "next start --hostname 127.0.0.1",
     "typecheck": "tsc --noEmit",
     "test": "node --conditions=react-server --import tsx --test tests/*.test.ts",
-    "campaign": "tsx scripts/campaign.ts",
-    "memory:export": "node --conditions=react-server --env-file=.env.local --import tsx scripts/memory-git.ts export",
-    "memory:import": "node --conditions=react-server --env-file=.env.local --import tsx scripts/memory-git.ts import"
+    "worker": "node --conditions=react-server --env-file=.env.local --import tsx scripts/worker.ts",
+    "desktop": "electron desktop/main.cjs",
+    "desktop:package": "node scripts/package-desktop.mjs",
+    "verify:store": "node --conditions=react-server --env-file=.env.local --import tsx scripts/verify-store.ts",
+    "verify:collaboration": "node scripts/verify-collaboration.mjs"
   },
   "dependencies": {
-    "@react-three/drei": "10.7.9",
-    "@react-three/fiber": "9.8.1",
     "lucide-react": "^0.577.0",
     "mongodb": "^7.1.0",
     "next": "16.3.6",
     "react": "19.3.0",
     "react-dom": "19.3.0",
     "server-only": "^0.0.1",
-    "three": "^0.183.2",
     "zod": "^4.3.6"
   },
   "devDependencies": {
+    "@electron/packager": "^20.3.0",
     "@types/node": "^25.5.0",
     "@types/react": "^19.2.14",
     "@types/react-dom": "^19.2.3",
-    "@types/three": "^0.183.1",
+    "electron": "^44.4.5",
+    "esbuild": "^0.28.2",
     "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }

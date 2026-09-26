@@ -1,141 +1,96 @@
-# AEGIS — the agent cyber range
+# Converge
 
-A 3D security operations building backed by a **Long Horizon Engineering** harness. Five specialist defenders share evidence, request containment approval, and carry incident memory into the next attack. A resumable ten-attack campaign measures adaptation across recurring attacks and new variants. The architectural interface stays focused on watching and inspecting the war room.
+**Different minds. One direction.**
 
-The network is a simulation. AEGIS does not scan real hosts, run exploits, or modify production infrastructure. The named agent roles are deterministic specialists by default. The optional live council uses a real OpenRouter model and can choose constrained actions on simulated assets.
+Converge is a local Mac workspace where several people guide one coding agent without losing each other's requirements. Alex can ask for a Stripe product catalog while Sam asks for `NEW` labels on the three latest products. Converge records both authors, identifies the dependency, and steers the running Codex turn toward the combined implementation. Incompatible requests stop for an explicit choice instead of silently overwriting earlier work.
+
+Built for the **Long Horizon Engineering** track: the core is a persistent execution harness with attributed intent, live steering, protected verification, bounded working context, and recoverable source checkpoints. The UI displays actual agent activity, diffs, checks, and Atlas state.
 
 ## Run locally
 
+Requirements: macOS, Node.js 24 or newer, npm, Git, a compatible installed Codex app-server executable, an OpenRouter API key, and access to the provisioned MongoDB Atlas sandbox. Atlas must allow the machine's network address and the database user must be able to read, write, create collections/indexes, and use transactions.
+
 ```sh
-npm install
+npm ci
+node node_modules/electron/install.js
+git submodule update --init vendor/codex
+cp .env.example .env.local
+```
+
+Set these values in `.env.local`:
+
+| Variable | Purpose |
+| --- | --- |
+| `MONGODB_URI` | URI for the provisioned Atlas sandbox; required, with no in-memory fallback |
+| `MONGODB_DB` | Database name; the existing sandbox configuration uses `aegis`, with separate `cv_` collections for Converge |
+| `OPENROUTER_API_KEY` | Server/worker credential for real model inference |
+| `OPENROUTER_MODEL` | Model used for semantic intent routing |
+| `CONVERGE_CODE_MODEL` | Model used by Codex through OpenRouter's Responses API |
+| `CONVERGE_CODEX_BINARY` | Optional override; defaults to `/Applications/ChatGPT.app/Contents/Resources/codex` |
+
+Use models available to your OpenRouter account and compatible with the selected API. Keys remain in the local environment file, outside the renderer and packaged application.
+
+Launch the native client:
+
+```sh
+npm run desktop
+```
+
+The launcher starts a loopback Next.js server and coding worker. It can reuse an already healthy Converge server and only stops child processes it owns. Alternatively, run the web client and worker in separate terminals:
+
+```sh
 npm run dev
+npm run worker
 ```
 
-Open [localhost:3000](http://localhost:3000). Add these **server-only** environment variables to `.env.local`:
+Open [the local workspace](http://127.0.0.1:3000). `/api/health` reports Atlas connectivity; the session also reports whether a worker heartbeat is current. A configured key alone is not proof that a model call has succeeded.
 
-```dotenv
-MONGODB_URI=mongodb+srv://<database-user>:<password>@<sandbox-host>/?retryWrites=true&w=majority
-MONGODB_DB=aegis
-OPENROUTER_API_KEY=<your-key>
-OPENROUTER_MODEL=google/gemini-3.8-flash
-```
+## Two-person demo
 
-Use the provisioned Atlas sandbox in the [project organization](https://cloud.mongodb.com/v2#/org/69ef9daf03d2ce35c2657862/projects). Its connection string must identify that sandbox; the organization URL alone is not a database connection string. Configure a database user with read/write access to the application database and permit the application's connection source in Atlas network access. Never commit `.env.local` or expose either credential through `NEXT_PUBLIC_` variables.
+1. Create a session. As **Alex**, send: “Connect Stripe and display the product catalog”.
+2. Use **Share session → Open collaborator window**. The second native window opens the same session as **Sam**. In a browser, use **Open as Sam** or copy the session link.
+3. While the agent is working, send: “Add NEW to the 3 most recently added Stripe products”. Watch the attributed dependency and the agent's actual activity. If the first turn is still active, the worker sends a real `turn/steer`; if it has finished, the amendment continues in the same coding thread.
+4. Inspect **Changes** for the generated source diff, independently checked results, and catalog fixture preview. Prices in the preview are dollars.
+5. Send “Remove all NEW badges” to exercise conflict arbitration. Choose whether to retain the earlier requirement or replace it; the choice remains in the intent history.
+6. Use **Memory** to inspect durable checkpoints. Pause and resume the session to continue from saved requirements and source state.
 
-`GET /api/health` verifies the actual Atlas connection. Without a URI, the app explicitly reports **session memory only**. With a URI that cannot connect, writes fail visibly instead of silently switching to memory. The in-memory fallback is for local exploration; it does not provide durable or shared storage on serverless deployments.
+The starter prompts only fill the composer. They do not submit work automatically. The catalog uses a **Stripe-compatible fixture**, including pagination and inactive products; no live Stripe account, checkout, or payment processing is connected.
 
-## The demo
+## What is real
 
-1. Orbit and zoom around the building. Toggle **Exploded floors** and **Cutaway**, switch to the top-down camera, or select a level in the campus plan. The bottom toolbar reveals network links, agents, and threat paths.
-2. Select **Ransomware outbreak (Operation Blackout)**, turn **Use learned policy** off, and launch an exercise. Five specialists detect, classify, trace, contain, and coordinate the intrusion. Click a room or agent to inspect it. Scan or isolate assets from the inspector; isolation protects neighbors but lowers availability. Select **Manual** defense to see the cost of delayed intervention.
-3. Let the incident finish. Scrub the timeline to inspect previous network states and open the incident archive to revisit the run.
-4. Open **Agent memory**. The harness evaluates the current and proposed policy on the incident seed plus two held-out seeds. A candidate must improve the mean score without regressing on any tested seed.
-5. Launch the same scenario with learned policy enabled. Compare the response time, integrity, and number of affected assets. Toggle **AI reasoning** for live model analysis and bounded defensive decisions.
+- **Codex execution:** a dedicated stdio app-server process edits a per-session local repository and emits real tool and turn events.
+- **OpenRouter inference:** semantic routing uses a bounded structured request; coding uses the app-server's OpenRouter provider. Conservative routing rules are an explicit fallback. Coding failures are surfaced rather than replaced by a scripted result.
+- **MongoDB Atlas persistence:** sessions, attributed intents, events, raw final trajectory records, memory checkpoints, and source manifests survive the UI and worker processes. Presence and worker liveness are separate expiring records.
+- **Live collaboration:** compatible new requirements can steer the current turn. Conflicts interrupt execution until a person chooses a resolution. Duplicate requests preserve provenance without requiring another coding turn.
+- **Independent verification:** trusted assertions run outside the generated repository against a controlled fixture. A generated test claiming success cannot mark the session complete. Unknown acceptance criteria require review.
+- **Bounded active memory:** the default context is at most 16,000 characters. All active requirements are retained; if they cannot fit, execution stops rather than dropping one. The durable archive is not loaded wholesale into the prompt.
 
-With seed 42, AI disabled, and no human intervention, the verified first adaptation produces:
+## Codex fork and runtime
 
-| Scenario           | Baseline integrity | Adapted integrity | First response |
-| ------------------ | -----------------: | ----------------: | -------------- |
-| Operation Blackout |                90% |               96% | 10s → 4s       |
-| Ghost in the Build |                85% |               96% | 10s → 4s       |
-| Silent Siphon      |                92% |               97% | 10s → 4s       |
+The actual fork is [Divyesh-Thirukonda/codex-converge](https://github.com/Divyesh-Thirukonda/codex-converge), pinned as the `vendor/codex` Git submodule at `d57fc7e6c298e6191f4cb8e4e096942edc2b4032`.
 
-These are simulation measurements, not claims about real-world security effectiveness. The harness adapts a small, explicit defense policy; it does not retrain model weights or rewrite application code.
+The demo currently launches the **installed compatible Codex runtime** through `lib/codex-bridge.ts`. It does **not** claim to execute a newly compiled binary from the fork. The fork is included as pinned source; the Converge collaboration, persistence, steering, and verification harness is implemented in this repository.
 
-## Ten attacks, one persistent memory
-
-With the development server running and Atlas connected:
+## Checks and Mac packaging
 
 ```sh
-npm run campaign -- --episodes 10 --scope shared --seed 42
-```
-
-The command prints a campaign ID and a resume command. Stop it at any point and resume from another process or machine connected to the same Atlas database:
-
-```sh
-npm run campaign -- --resume <campaign-id>
-```
-
-Attack 1 establishes the first incident report. Later attacks retrieve relevant evidence and the locally evaluated policy. Attack 7 changes the entry point and propagation timing. Attack 10 introduces delayed detection and slower propagation. Anticipation activates only after recalling three successful incidents with cited entry-and-defense evidence; episode number alone cannot enable it.
-
-The [verified Atlas campaign](docs/verified-campaign.json) completed all ten incidents, including a server restart at checkpoint revision 20:
-
-| Attack | Behavior                                           | Integrity | First response |
-| ------ | -------------------------------------------------- | --------: | -------------: |
-| 1      | No prior incident memory                           |       90% |            10s |
-| 2      | Recalls attack 1; evaluated policy v2              |       96% |             4s |
-| 7      | Transfers prior defense to lateral-shift variant   |       97% |             2s |
-| 10     | Evidence-backed anticipation; low-and-slow variant |       97% |             2s |
-
-These campaign episodes use different seeds. The per-incident evaluator separately compares baseline and candidate on matched seeds. This run used deterministic specialists; a separate live OpenRouter check verified the model council with retrieved memory and current handoffs.
-
-Each report records the observed intrusion, uncertain motive hypotheses, outcome, successful defenses, failures, next actions, recalled source IDs, metrics, and evaluation evidence. Atlas retains the archive while each agent receives a bounded context. An explicit worker advances the campaign; closing it saves progress rather than leaving an invisible background job running.
-
-Share the learned incident history through this repository:
-
-```sh
-npm run memory:export -- --scope shared --push
-# On a teammate's machine, after pulling and reviewing the bundle:
-npm run memory:import -- --scope shared
-```
-
-Imported reports inform recall. Imported policy recommendations never become active automatically. See [harness design](docs/HARNESS.md) and [Git memory sharing](docs/MEMORY-SHARING.md) for the protocols and trust boundaries.
-
-## Architecture
-
-```text
-Next.js + React Three Fiber war room
-       │ validated same-origin HTTP requests
-       ▼
-Next.js route handlers ──► optional OpenRouter council
-       │                       │ validated isolate / scan / monitor
-       ▼                       ▼
-Seeded graph simulation + evidence-linked specialist handoffs
-       │
-       ├──► Atlas runs: canonical snapshots, events, metrics, replay
-       ├──► Atlas events: searchable evidence projection
-       ├──► Atlas incident memories ──► bounded recall ──► next exercise
-       ├──► Three-seed evaluator ──► Atlas policies ──► next exercise
-       └──► Atlas campaign checkpoints + portable Git memory bundles
-```
-
-- `lib/simulation.ts` contains pure, seeded transition functions. Three attack scenarios propagate across a twelve-asset graph, with deterministic detection, containment, damage, availability, and evidence generation. A tick represents two simulated seconds.
-- `components/war-room-scene.tsx` renders the campus with React Three Fiber, instanced server equipment, animated floor transitions, moving agents, and network packets. `lib/building-layout.ts` maps the twelve network assets to physical rooms. `hooks/use-war-room.ts` serializes simulation commands and protects the client against stale responses. Replay shows historical room states and communications; agent positions are shown only in the current view.
-- `lib/war-room-harness.ts` enforces Sentinel observation → Cipher assessment → Trace evidence handoff → Bastion containment proposal → Nexus approval → Bastion execution. Every stage references current incident evidence and its preceding message. Historical memory cannot authorize isolation.
-- `lib/agents.ts` calls OpenRouter from the server. JSON Schema plus Zod validate one to three decisions; the harness then enforces role-specific tools and the same containment approval gate. The optional council uses one model request to produce specialist recommendations, not five independent model processes.
-- `lib/db.ts` stores full runs, incident reports, policies, campaign checkpoints, and rate-limit counters. Per-run and per-campaign leases exclude concurrent mutations. A terminal incident's memory, policy update, and learned marker commit in one Atlas transaction; reads repair interrupted finalization.
-- Policy improvement compares baseline and candidate rollouts on the same scenario and variant across three seeds. The score is `0.65 × integrity + 0.35 × uptime − 0.1 × exfiltratedMB − 30 if breached`. Each evaluation records all three cases; promotion requires a mean gain and no per-seed regression.
-- Standalone runs and the searchable event projection expire after seven days. Campaign runs, campaign checkpoints, incident memories, and policies persist. Canonical campaign runs retain their event evidence independently of the projection.
-
-## API
-
-All run responses include `{run, storage: {mode, persisted}}`; `persisted: true` is returned only after successful Atlas operations.
-
-| Method | Endpoint                     | Purpose                                                                                                                         |
-| ------ | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
-| `GET`  | `/api/health`                | Actual database connection state and AI configuration                                                                           |
-| `POST` | `/api/runs`                  | Create a run; accepts `scenarioId`, `seed`, `autoDefend`, `aiEnabled`, `useLearnedPolicy`, optional `variant` and `memoryScope` |
-| `GET`  | `/api/runs`                  | Most recent 20 runs                                                                                                             |
-| `GET`  | `/api/runs/:id`              | Full state, metrics, events, and replay                                                                                         |
-| `POST` | `/api/runs/:id/step`         | Advance once; optionally require `expectedTick`                                                                                 |
-| `POST` | `/api/runs/:id/action`       | `{type: "isolate" \| "restore" \| "scan", nodeId}` or `{type: "auto-defend", enabled}`                                          |
-| `GET`  | `/api/memory?scope=shared`   | Policies, incident narratives, metrics, and evaluation evidence                                                                 |
-| `POST` | `/api/campaigns`             | Create a campaign; accepts `scenarioId`, `seed`, `episodes`, `aiEnabled`, `memoryScope`                                         |
-| `GET`  | `/api/campaigns/:id`         | Read the durable campaign checkpoint                                                                                            |
-| `POST` | `/api/campaigns/:id/advance` | Advance one checkpoint; accepts `expectedRevision` for conflict detection                                                       |
-
-AI is off by default. When enabled, it is consulted every four ticks, at most four times per exercise and forty times per hour across the deployment. Each request is capped at 1,600 completion tokens and ten seconds. Failed, unavailable, or invalid model responses leave the deterministic defenders active and report the fallback honestly. OpenRouter model availability was checked against its public models endpoint; the model can be overridden through the environment.
-
-The current demo is a shared synthetic workspace without account authentication. It is intended for a controlled hackathon demonstration. A production training service would additionally require tenant isolation, authentication, per-user budgets, and broader policy evaluation across held-out scenarios.
-
-## Verify
-
-```sh
-npm test
 npm run typecheck
+npm test
+npm run verify:store
 npm run build
+npm run desktop:package
 ```
 
-Tests cover deterministic replay, outcomes, policy evaluation, evidence-chain and tool-permission enforcement, context compaction, relevant recall, anticipation support, campaign crash recovery, concurrent workers, immutable imports, credential rejection, and bundle integrity. The campaign command requires verified Atlas persistence and refuses session-only storage. The project demonstrates bounded coherent memory over repeated incidents; it has not been tested at billions of tokens or weeks of continuous operation.
+Packaging produces `dist/Converge-darwin-arm64/Converge.app` with the Next.js standalone runtime, bundled worker, fixture, and verifier. It is a local Apple Silicon demo build, not a signed/notarized distribution. Credentials and working data stay outside the bundle. The launcher records this machine's external environment/data paths; set `CONVERGE_ENV_FILE` and `CONVERGE_DATA_DIR` when using different locations. Packaging does not rebuild or bundle the Codex fork binary.
 
-Useful references: [Next.js route handlers](https://nextjs.org/docs/app/getting-started/route-handlers), [OpenRouter structured output](https://openrouter.ai/docs/guides/features/structured-outputs), and [OpenRouter reasoning budgets](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens).
+A recorded live run is in [docs/verified-demo.json](docs/verified-demo.json): two authors, one acknowledged live steer, four protected checks passing, source restoration after restarting the worker, duplicate suppression, and conflict resolution through two native windows. The provider interrupted the first turn; a resumed turn completed the same Codex thread.
+
+Run `npm run verify:collaboration` with the app or web server and worker running to exercise real inference. It creates a new demo session and uses OpenRouter credits. `npm run verify:store` checks Atlas transactions and cleans up its own test records.
+
+The automated suite covers intent relationships and conflict preservation, context bounds and source attribution, app-server transport/lifecycle isolation, and source checkpoint validation/recovery. See [the architecture](docs/ARCHITECTURE.md) for the protocols and limits.
+
+## Current scope
+
+Alex, Sam, and Jordan are local demonstration personas, not authenticated accounts. Shared URLs identify a local session; they do not provide cloud execution or an authenticated remote collaboration service. Execution runs on the local Mac, with Atlas for persistence and OpenRouter for inference. The supported verification surface is the Stripe-compatible fixture, not arbitrary application correctness. No billion-token or large-scale reliability result is claimed.
+
+The earlier AEGIS application is retained in the Git tag `archive/aegis-final`.

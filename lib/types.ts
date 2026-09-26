@@ -1,169 +1,105 @@
-import type { HarnessState, IncidentVariant } from "./harness-types";
-
-export type ScenarioId = "ransomware" | "supply-chain" | "exfiltration";
-export type AgentId = "sentinel" | "cipher" | "bastion" | "trace" | "nexus";
-export type NodeStatus = "healthy" | "exposed" | "compromised" | "isolated";
-export type RunStatus = "ready" | "running" | "contained" | "breached";
-
-export interface NetworkNode {
+export type PersonId = "alex" | "sam" | "jordan";
+export const PEOPLE = [
+  { id: "alex" as const, name: "Alex Morgan", initials: "AM", color: "#6579c5", role: "Engineering" },
+  { id: "sam" as const, name: "Sam Chen", initials: "SC", color: "#ad7854", role: "Product" },
+  { id: "jordan" as const, name: "Jordan Lee", initials: "JL", color: "#648776", role: "Design" },
+];
+export type IntentRelation = "start" | "extend" | "depend" | "duplicate" | "conflict" | "parallel";
+export type IntentStatus = "queued" | "accepted" | "blocked" | "fulfilled" | "superseded" | "duplicate";
+export interface RoutingDecision {
+  relation: IntentRelation;
+  summary: string;
+  reason: string;
+  parentIntentIds: string[];
+  acceptance: string[];
+  source: "openrouter" | "rules";
+}
+export interface Intent {
   id: string;
-  label: string;
-  type:
-    "gateway" | "workstation" | "server" | "database" | "identity" | "storage";
-  zone: "perimeter" | "operations" | "core";
-  position: [number, number, number];
-  status: NodeStatus;
-  health: number;
-  risk: number;
-  detected: boolean;
-  connections: string[];
-  compromisedAt?: number;
-  isolatedAt?: number;
-}
-
-export interface AgentState {
-  id: AgentId;
-  name: string;
-  role: string;
-  color: string;
-  status: "monitoring" | "analyzing" | "defending" | "complete";
-  task: string;
-  confidence: number;
-  actions: number;
-  targetNodeId?: string;
-}
-
-export interface SimulationEvent {
-  id: string;
-  tick: number;
-  agentId: AgentId | "attacker" | "commander" | "system";
-  kind:
-    | "system"
-    | "detection"
-    | "analysis"
-    | "attack"
-    | "defense"
-    | "recovery"
-    | "decision";
-  message: string;
-  nodeId?: string;
-  confidence?: number;
-  source?: "simulation" | "openrouter" | "human";
-}
-
-export interface RunMetrics {
-  containment: number;
-  integrity: number;
-  threatsBlocked: number;
-  compromised: number;
-  uptime: number;
-  elapsedSeconds: number;
-  responseTime: number;
-  exfiltratedMB: number;
-}
-
-export interface SimulationRun {
-  id: string;
-  scenarioId: ScenarioId;
-  variant?: IncidentVariant;
-  memoryScope?: string;
-  campaign?: { id: string; episode: number };
-  harness?: HarnessState;
-  status: RunStatus;
-  tick: number;
-  seed: number;
+  sessionId: string;
+  authorId: PersonId;
+  text: string;
+  createdAt: string;
   revision: number;
-  nodes: NetworkNode[];
-  events: SimulationEvent[];
-  metrics: RunMetrics;
-  agents: AgentState[];
-  autoDefend: boolean;
+  status: IntentStatus;
+  decision?: RoutingDecision;
+  resolution?: "keep-existing" | "replace-existing";
+}
+export interface PlanStep {
+  id: string;
+  title: string;
+  intentIds: string[];
+  dependsOn: string[];
+  status: "pending" | "running" | "done" | "blocked";
+}
+export interface SharedPlan {
+  summary: string;
+  steps: PlanStep[];
+  constraints: Array<{ intentId: string; text: string; authorId: PersonId }>;
+  revision: number;
+}
+export interface CheckResult { name: string; passed: boolean; detail: string; intentIds: string[] }
+export interface Product { id: string; name: string; price: number; created: number; badge?: string }
+export interface Artifact {
+  files: Array<{ path: string; additions: number; deletions: number }>;
+  diff: string;
+  checks: CheckResult[];
+  products: Product[];
+  stripeConnected: boolean;
+  verifiedRevision: number;
+  updatedAt: string;
+}
+export interface SessionMetrics {
+  turns: number; toolCalls: number; mergedIntents: number; avoidedRuns: number;
+  checksPassed: number; checksTotal: number; contextChars: number; archivedEvents: number;
+  providerTokens: number; steers: number;
+}
+export interface Session {
+  id: string;
+  name: string;
+  goal: string;
   createdAt: string;
   updatedAt: string;
-  ai: {
-    enabled: boolean;
-    mode: "simulation" | "openrouter";
-    requests: number;
-    tokens: number;
-    lastTick: number;
-    error?: string;
-    model?: string;
-  };
-  attack: { stage: number; wavesSpawned: number; lastSpreadTick: number };
-  history: Array<{
-    tick: number;
-    integrity: number;
-    containment: number;
-    compromised: number;
-  }>;
-  snapshots: Array<{ tick: number; nodes: NetworkNode[]; metrics: RunMetrics }>;
-  policy: DefensePolicy;
-  learned?: boolean;
+  revision: number;
+  processedRevision: number;
+  status: "idle" | "planning" | "running" | "review" | "blocked" | "complete" | "error" | "paused";
+  plan: SharedPlan;
+  metrics: SessionMetrics;
+  codexThreadId?: string;
+  activeTurnId?: string;
+  lastCheckpointAt?: string;
+  sourceCheckpointId?: string;
+  artifact?: Artifact;
+  error?: string;
+  pauseRequested?: boolean;
+  leaseOwner?: string;
+  leaseUntil?: string;
 }
-
-export interface DefensePolicy {
-  scenarioId: ScenarioId;
-  version: number;
-  isolationDelay: number;
-  scanCadence: number;
-  learnedFrom: string[];
-  lesson: string;
-  updatedAt?: string;
-  evidence?: {
-    previousIntegrity: number;
-    compromisedNodes: number;
-    ticks: number;
-    evaluation?: {
-      seed: number;
-      baselineScore: number;
-      candidateScore: number;
-      accepted: boolean;
-      baselineIntegrity: number;
-      candidateIntegrity: number;
-      validation?: {
-        seeds: number[];
-        cases: Array<{
-          seed: number;
-          baselineScore: number;
-          candidateScore: number;
-          baselineIntegrity: number;
-          candidateIntegrity: number;
-        }>;
-        meanBaselineScore: number;
-        meanCandidateScore: number;
-        noRegression: boolean;
-      };
-    };
-  };
+export interface TrajectoryEvent {
+  id: string;
+  sessionId: string;
+  sequence: number;
+  createdAt: string;
+  kind: "intent" | "routing" | "merge" | "conflict" | "agent" | "tool" | "checkpoint" | "verification" | "system";
+  actor: string;
+  title: string;
+  detail: string;
+  intentIds: string[];
+  turnId?: string;
 }
-
-export type Run = SimulationRun;
-export type RunAction =
-  | { type: "isolate" | "restore" | "scan"; nodeId: string }
-  | { type: "auto-defend"; enabled: boolean };
-
-export interface Scenario {
-  id: ScenarioId;
-  name: string;
-  subtitle: string;
-  description: string;
-  difficulty: "HIGH" | "CRITICAL" | "STEALTH";
-  duration: string;
-  color: string;
-  entryNodeId: string;
-  targetNodeId: string;
-  spreadInterval: number;
-  damagePerTick: number;
-  attackName: string;
-  technique: string;
-  objectives: string[];
+export interface MemoryCheckpoint {
+  sourceEventIds?: string[];
+  id: string; sessionId: string; createdAt: string; revision: number;
+  summary: string; intentIds: string[]; decisions: string[];
+  eventCount: number; contextChars: number; codexThreadId?: string;
 }
-
-export interface StorageStatus {
-  mode: "atlas" | "memory";
-  persisted: boolean;
-}
-export interface RunResponse {
-  run: SimulationRun;
-  storage: StorageStatus;
+export interface Presence { personId: PersonId; sessionId: string; seenAt: string }
+export interface SessionSnapshot {
+  session: Session;
+  intents: Intent[];
+  events: TrajectoryEvent[];
+  checkpoints: MemoryCheckpoint[];
+  presence: Presence[];
+  worker: { online: boolean; engine: string; lastSeenAt?: string };
+  storage: { mode: "atlas"; connected: boolean };
 }

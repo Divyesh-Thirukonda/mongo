@@ -1,12 +1,8 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-const geist = Geist({ subsets: ["latin"], variable: "--font-geist" });
-const mono = Geist_Mono({ subsets: ["latin"], variable: "--font-mono" });
 export const metadata: Metadata = {
-  title: "AEGIS — The autonomous defense room",
-  description:
-    "A living cyber range. Watch an AI defense team detect, reason, contain, and learn from simulated attacks.",
+  title: "Converge — One shared direction",
+  description: "A collaborative coding workspace. Bring different perspectives into one shared agent session.",
   icons: { icon: "/favicon.svg" },
 };
 export default function RootLayout({
@@ -14,7 +10,7 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body className={`${geist.variable} ${mono.variable}`}>{children}</body>
+      <body>{children}</body>
     </html>
   );
 }

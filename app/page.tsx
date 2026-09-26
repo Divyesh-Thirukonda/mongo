@@ -1,4 +1,5 @@
-import WarRoom from "@/components/war-room";
+import Workspace from "@/components/workspace";
+
 export default function Home() {
-  return <WarRoom />;
+  return <Workspace />;
 }
